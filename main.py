@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 try:  # pragma: no cover - 运行在 AstrBot 环境时会走真实导入
+    from astrbot.api import AstrBotConfig
     from astrbot.api.event import AstrMessageEvent, filter
     from astrbot.api.star import Context, Star, register
     from astrbot.api.message_components import File
@@ -36,6 +37,13 @@ except Exception:  # pragma: no cover - 当前开发环境下使用兼容占位
 
     class AstrMessageEvent:  # type: ignore[no-redef]
         pass
+
+    class AstrBotConfig:  # type: ignore[no-redef]
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self._data = {}
+
+        def get(self, key: str, default: Any = None) -> Any:
+            return self._data.get(key, default)
 
     class File:  # type: ignore[no-redef]
         def __init__(self, name: str = "", url: str = "") -> None:
@@ -134,8 +142,9 @@ class Plugin(Star):
         "源文件",
     }
 
-    def __init__(self, context: Context | None = None) -> None:
+    def __init__(self, context: Context | None = None, config: AstrBotConfig | None = None) -> None:
         super().__init__(context)
+        self.config = config
         self.name = "astrbot_plugin_xelatex_pdf"
         self.initialized = False
         self.data_dir = Path(tempfile.gettempdir()) / self.name
@@ -149,10 +158,16 @@ class Plugin(Star):
         self.chat_history = self._load_history()
         self.last_tex_source_by_session: dict[str, str] = {}
         self.last_pdf_by_session: dict[str, Path] = {}
-        self.active_model_name = os.environ.get("XELATEX_MODEL_NAME", "default")
-        self.available_models = [
+        self.text_api_url = self._get_config_value("text_api_url", "XELATEX_TEXT_API_URL", "").rstrip("/")
+        self.text_api_key = self._get_config_value("text_api_key", "XELATEX_TEXT_API_KEY", "")
+        self.active_model_name = self._get_config_value("llm_model", "XELATEX_MODEL_NAME", "default")
+        fallback_models = self._get_config_value("fallback_models", "XELATEX_AVAILABLE_MODELS", "")
+        self.available_models = [item.strip() for item in fallback_models.split(",") if item.strip()]
+        self._remember_available_model(self.active_model_name)
+        self.vision_model_name = self._get_config_value("llm_vision_model", "XELATEX_VISION_MODEL", "")
+        self.fallback_vision_models = [
             item.strip()
-            for item in os.environ.get("XELATEX_AVAILABLE_MODELS", "default").split(",")
+            for item in self._get_config_value("fallback_vision_models", "XELATEX_FALLBACK_VISION_MODELS", "").split(",")
             if item.strip()
         ]
         self.tex_environment = TexEnvironment(
@@ -160,11 +175,10 @@ class Plugin(Star):
             latexmk=shutil.which("latexmk"),
             pdflatex=shutil.which("pdflatex"),
         )
-        self.file_server_port = int(os.environ.get("XELATEX_FILE_PORT", "8765"))
-        self.file_server_host = os.environ.get("XELATEX_FILE_HOST", "0.0.0.0")
-        self.public_base_url = os.environ.get(
-            "XELATEX_PUBLIC_BASE_URL", f"http://127.0.0.1:{self.file_server_port}"
-        ).rstrip("/")
+        self.file_server_port = int(self._get_config_value("file_server_port", "XELATEX_FILE_PORT", "8765"))
+        self.file_server_host = self._get_config_value("file_server_host", "XELATEX_FILE_HOST", "0.0.0.0")
+        public_base_url = self._get_config_value("public_base_url", "XELATEX_PUBLIC_BASE_URL", "")
+        self.public_base_url = (public_base_url or f"http://127.0.0.1:{self.file_server_port}").rstrip("/")
         self._file_server: ThreadingHTTPServer | None = None
         self._file_server_thread: threading.Thread | None = None
         self._start_file_server()
@@ -184,6 +198,7 @@ class Plugin(Star):
             "available": self.tex_environment.available,
             "active_model": self.active_model_name,
             "available_models": self.available_models,
+            "text_api_configured": bool(self.text_api_url),
             "file_server": self.public_base_url,
         }
 
@@ -223,7 +238,7 @@ class Plugin(Star):
         if not command_text:
             model_switch = self._extract_model_switch(parsed_message.text or parsed_message.reply_text)
             if model_switch:
-                self.active_model_name = model_switch
+                self._set_active_model(model_switch)
                 return CommandResponse(success=True, message=f"已切换模型：{model_switch}")
             return CommandResponse(success=False, message="消息中没有可处理的命令")
 
@@ -231,7 +246,7 @@ class Plugin(Star):
 
         model_switch = self._extract_model_switch(command_text)
         if model_switch:
-            self.active_model_name = model_switch
+            self._set_active_model(model_switch)
             return CommandResponse(success=True, message=f"已切换模型：{model_switch}")
 
         if self._is_source_export_command(command_text):
@@ -324,7 +339,7 @@ class Plugin(Star):
             model_index = request.args.index("-m")
             model_name = request.args[model_index + 1] if model_index + 1 < len(request.args) else ""
             if model_name:
-                self.active_model_name = model_name
+                self._set_active_model(model_name)
             return CommandResponse(success=True, message=f"已切换模型：{model_name or '未指定'}")
 
         if tex_source is None:
@@ -430,14 +445,65 @@ class Plugin(Star):
             parts.append(f"log: {log_snippet[:800]}")
         return "\n".join(parts)
 
+    def _get_config_value(self, key: str, env_key: str, default: Any = "") -> Any:
+        if self.config is not None:
+            value = self.config.get(key, None)
+            if value not in (None, ""):
+                return value
+        return os.environ.get(env_key, default)
+
+    def _remember_available_model(self, model_name: str) -> None:
+        model_name = (model_name or "").strip()
+        if not model_name:
+            return
+        if model_name not in self.available_models:
+            self.available_models.insert(0, model_name)
+
+    def _set_active_model(self, model_name: str) -> None:
+        model_name = (model_name or "").strip()
+        if not model_name:
+            return
+        self.active_model_name = model_name
+        self._remember_available_model(model_name)
+
+    def _fetch_remote_models(self) -> list[str]:
+        if not self.text_api_url:
+            return []
+        request = urllib.request.Request(f"{self.text_api_url}/models")
+        if self.text_api_key:
+            request.add_header("Authorization", f"Bearer {self.text_api_key}")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        models: list[str] = []
+        raw_models = payload.get("data", []) if isinstance(payload, dict) else []
+        for item in raw_models:
+            model_id = None
+            if isinstance(item, dict):
+                model_id = item.get("id") or item.get("name")
+            elif item is not None:
+                model_id = str(item)
+            if model_id:
+                models.append(str(model_id))
+        return models
+
     def _format_model_list(self) -> str:
-        models = self.available_models or [self.active_model_name]
-        return "\n".join(
-            [
-                f"当前模型：{self.active_model_name}",
-                "可用模型：" + ", ".join(models),
-            ]
-        )
+        remote_models: list[str] = []
+        remote_error = ""
+        try:
+            remote_models = self._fetch_remote_models()
+        except Exception as exc:
+            remote_error = str(exc)
+        if remote_models:
+            self.available_models = remote_models
+            self._remember_available_model(self.active_model_name)
+        models = remote_models or self.available_models or [self.active_model_name]
+        lines = [
+            f"当前模型：{self.active_model_name}",
+            "可用模型：" + ", ".join(models),
+        ]
+        if remote_error:
+            lines.append(f"远程查询失败，已使用本地列表：{remote_error[:200]}")
+        return "\n".join(lines)
 
     def _read_log_snippet(self, log_path: Optional[Path]) -> str:
         if log_path is None or not log_path.exists():

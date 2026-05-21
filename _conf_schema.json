@@ -1,0 +1,57 @@
+{
+    "text_api_url": {
+        "description": "逻辑大脑（文本）接口地址",
+        "type": "string",
+        "hint": "用于文本生成和查询模型列表的 OpenAI-compatible 接口地址，例如 https://api.deepseek.com/v1",
+        "default": ""
+    },
+    "text_api_key": {
+        "description": "逻辑大脑（文本）API Key",
+        "type": "string",
+        "hint": "用于文本模型接口的 API 密钥",
+        "obvious_hint": true,
+        "default": ""
+    },
+    "llm_model": {
+        "description": "默认文本模型名称",
+        "type": "string",
+        "hint": "默认使用的文本模型，例如 deepseek-chat",
+        "default": "default"
+    },
+    "fallback_models": {
+        "description": "备用文本模型列表（逗号分隔）",
+        "type": "string",
+        "hint": "可用模型或备用模型列表，例如 deepseek-chat,gpt-4o,qwen-plus",
+        "default": ""
+    },
+    "llm_vision_model": {
+        "description": "默认视觉识别模型名称",
+        "type": "string",
+        "hint": "预留给图片理解/OCR 的多模态模型，例如 qwen-vl-max 或 gpt-4o",
+        "default": ""
+    },
+    "fallback_vision_models": {
+        "description": "备用视觉模型列表（逗号分隔）",
+        "type": "string",
+        "hint": "预留给视觉识别失败时依次尝试的模型，例如 qwen-vl-plus,gpt-4o",
+        "default": ""
+    },
+    "file_server_host": {
+        "description": "文件服务监听地址",
+        "type": "string",
+        "hint": "用于回传 PDF 文件的本地 HTTP 服务监听地址",
+        "default": "0.0.0.0"
+    },
+    "file_server_port": {
+        "description": "文件服务端口",
+        "type": "int",
+        "hint": "用于回传 PDF 文件的本地 HTTP 服务端口",
+        "default": 8765
+    },
+    "public_base_url": {
+        "description": "文件公网访问地址",
+        "type": "string",
+        "hint": "留空时使用 http://127.0.0.1:文件服务端口；容器部署时可填写可被 AstrBot 访问的地址",
+        "default": ""
+    }
+}
