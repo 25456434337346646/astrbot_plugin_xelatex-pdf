@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import urllib.request
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
 
@@ -118,7 +121,18 @@ class SessionMemory:
 class Plugin(Star):
     """AstrBot XeLaTeX PDF 插件骨架。"""
 
-    command_aliases = {"/ai", "/ask", "/解答", "/解析"}
+    command_aliases = {
+        "/ai",
+        "/ask",
+        "/解答",
+        "/解析",
+        "/查模型",
+        "查模型",
+        "/ai_source",
+        "ai_source",
+        "/源文件",
+        "源文件",
+    }
 
     def __init__(self, context: Context | None = None) -> None:
         super().__init__(context)
@@ -128,18 +142,37 @@ class Plugin(Star):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.asset_dir = self.data_dir / "assets"
         self.asset_dir.mkdir(parents=True, exist_ok=True)
+        self.export_dir = self.data_dir / "exports"
+        self.export_dir.mkdir(parents=True, exist_ok=True)
         self.history_file = self.data_dir / "chat_history.json"
         self.max_history_rounds = 5
         self.chat_history = self._load_history()
+        self.last_tex_source_by_session: dict[str, str] = {}
+        self.last_pdf_by_session: dict[str, Path] = {}
+        self.active_model_name = os.environ.get("XELATEX_MODEL_NAME", "default")
+        self.available_models = [
+            item.strip()
+            for item in os.environ.get("XELATEX_AVAILABLE_MODELS", "default").split(",")
+            if item.strip()
+        ]
         self.tex_environment = TexEnvironment(
             xelatex=shutil.which("xelatex"),
             latexmk=shutil.which("latexmk"),
             pdflatex=shutil.which("pdflatex"),
         )
+        self.file_server_port = int(os.environ.get("XELATEX_FILE_PORT", "8765"))
+        self.file_server_host = os.environ.get("XELATEX_FILE_HOST", "0.0.0.0")
+        self.public_base_url = os.environ.get(
+            "XELATEX_PUBLIC_BASE_URL", f"http://127.0.0.1:{self.file_server_port}"
+        ).rstrip("/")
+        self._file_server: ThreadingHTTPServer | None = None
+        self._file_server_thread: threading.Thread | None = None
+        self._start_file_server()
 
     async def initialize(self) -> None:
         """插件启动钩子。"""
         self.initialized = True
+        self._start_file_server()
         return None
 
     def get_environment_status(self) -> dict[str, object]:
@@ -149,11 +182,30 @@ class Plugin(Star):
             "latexmk": self.tex_environment.latexmk,
             "pdflatex": self.tex_environment.pdflatex,
             "available": self.tex_environment.available,
+            "active_model": self.active_model_name,
+            "available_models": self.available_models,
+            "file_server": self.public_base_url,
         }
 
     @filter.command("ai", alias={"ask", "解答", "解析"})
     async def handle_ai(self, event: AstrMessageEvent):
         response = self.handle_event(event)
+        async for result in self._yield_response(event, response):
+            yield result
+
+    @filter.command("查模型")
+    async def handle_model_list(self, event: AstrMessageEvent):
+        response = self.handle_command("/查模型", session_id=self.get_session_id(event))
+        async for result in self._yield_response(event, response):
+            yield result
+
+    @filter.command("ai_source", alias={"源文件"})
+    async def handle_source_export(self, event: AstrMessageEvent):
+        response = self.handle_command("/ai_source", session_id=self.get_session_id(event))
+        async for result in self._yield_response(event, response):
+            yield result
+
+    async def _yield_response(self, event: AstrMessageEvent, response: CommandResponse):
         if response.file_payload:
             file_payload = response.file_payload
             if hasattr(event, "chain_result"):
@@ -165,18 +217,42 @@ class Plugin(Star):
             yield response.message
 
     def handle_event(self, event: Any) -> CommandResponse:
+        session_id = self.get_session_id(event)
         parsed_message = self.parse_message(event)
         command_text = self._extract_command_text(parsed_message)
         if not command_text:
+            model_switch = self._extract_model_switch(parsed_message.text or parsed_message.reply_text)
+            if model_switch:
+                self.active_model_name = model_switch
+                return CommandResponse(success=True, message=f"已切换模型：{model_switch}")
             return CommandResponse(success=False, message="消息中没有可处理的命令")
 
         parsed_message = self.localize_attachments(parsed_message)
-        tex_source = self.build_tex_source(parsed_message)
-        response = self.handle_command(command_text, tex_source=tex_source)
 
-        session_id = self.get_session_id(event)
+        model_switch = self._extract_model_switch(command_text)
+        if model_switch:
+            self.active_model_name = model_switch
+            return CommandResponse(success=True, message=f"已切换模型：{model_switch}")
+
+        if self._is_source_export_command(command_text):
+            source = self.last_tex_source_by_session.get(session_id)
+            if not source:
+                return CommandResponse(success=False, message="当前会话没有可导出的源文件")
+            source_path = self._write_export_file(session_id, source, ".tex")
+            return CommandResponse(
+                success=True,
+                message="已导出源文件",
+                file_payload=self.build_file_payload(source_path),
+            )
+
+        tex_source = self.build_tex_source(parsed_message)
+        self.last_tex_source_by_session[session_id] = tex_source
+        response = self.handle_command(command_text, tex_source=tex_source, session_id=session_id)
+
         if response.success and response.compile_result and response.compile_result.success:
             self.append_history(session_id, parsed_message.text or command_text, response.message)
+            if response.file_payload and response.file_payload.get("path"):
+                self.last_pdf_by_session[session_id] = Path(response.file_payload["path"])
 
         return response
 
@@ -221,18 +297,34 @@ class Plugin(Star):
 
         return CommandRequest(command=command, args=parts[1:], raw_text=stripped)
 
-    def handle_command(self, text: str, tex_source: Optional[str] = None) -> CommandResponse:
+    def handle_command(self, text: str, tex_source: Optional[str] = None, session_id: str = "default") -> CommandResponse:
         request = self.parse_command(text)
         if request is None:
             return CommandResponse(success=False, message="未识别的命令")
 
+        if request.command in {"/查模型", "查模型"}:
+            return CommandResponse(success=True, message=self._format_model_list())
+
+        if request.command in {"/ai_source", "ai_source", "/源文件", "源文件"}:
+            source = self.last_tex_source_by_session.get(session_id)
+            if not source:
+                return CommandResponse(success=False, message="当前会话没有可导出的源文件")
+            source_path = self._write_export_file(session_id, source, ".tex")
+            return CommandResponse(
+                success=True,
+                message="已导出源文件",
+                file_payload=self.build_file_payload(source_path),
+            )
+
         if request.args[:1] == ["clear"]:
-            self.clear_session_history(self.get_session_id(None))
+            self.clear_session_history(session_id)
             return CommandResponse(success=True, message="会话已清空")
 
         if "-m" in request.args:
             model_index = request.args.index("-m")
             model_name = request.args[model_index + 1] if model_index + 1 < len(request.args) else ""
+            if model_name:
+                self.active_model_name = model_name
             return CommandResponse(success=True, message=f"已切换模型：{model_name or '未指定'}")
 
         if tex_source is None:
@@ -241,8 +333,17 @@ class Plugin(Star):
         compile_result = self.compile_tex(tex_source)
         if compile_result.success:
             file_payload = self.build_file_payload(compile_result.pdf_path)
-            return CommandResponse(success=True, message="编译成功", compile_result=compile_result, file_payload=file_payload)
-        return CommandResponse(success=False, message=self.build_compile_error_message(compile_result), compile_result=compile_result)
+            return CommandResponse(
+                success=True,
+                message="编译成功",
+                compile_result=compile_result,
+                file_payload=file_payload,
+            )
+        return CommandResponse(
+            success=False,
+            message=self.build_compile_error_message(compile_result),
+            compile_result=compile_result,
+        )
 
     def compile_tex(self, tex_source: str) -> CompileResult:
         if not self.tex_environment.xelatex:
@@ -288,11 +389,14 @@ class Plugin(Star):
     def build_file_payload(self, pdf_path: Optional[Path]) -> Optional[dict[str, Any]]:
         if pdf_path is None:
             return None
+        exported_path = self._copy_to_export_dir(pdf_path)
+        if exported_path is None:
+            return None
         return {
             "type": "file",
-            "name": pdf_path.name,
-            "path": str(pdf_path),
-            "url": pdf_path.as_uri(),
+            "name": exported_path.name,
+            "path": str(exported_path),
+            "url": self._public_file_url(exported_path),
         }
 
     def build_tex_source(self, parsed_message: ParsedMessage) -> str:
@@ -326,6 +430,15 @@ class Plugin(Star):
             parts.append(f"log: {log_snippet[:800]}")
         return "\n".join(parts)
 
+    def _format_model_list(self) -> str:
+        models = self.available_models or [self.active_model_name]
+        return "\n".join(
+            [
+                f"当前模型：{self.active_model_name}",
+                "可用模型：" + ", ".join(models),
+            ]
+        )
+
     def _read_log_snippet(self, log_path: Optional[Path]) -> str:
         if log_path is None or not log_path.exists():
             return ""
@@ -335,9 +448,6 @@ class Plugin(Star):
             return ""
         return content[-2000:]
 
-    def _build_image_block(self, images: list[MessageAttachment]) -> str:
-        if not images:
-            return ""
     def _build_image_block(self, images: list[MessageAttachment]) -> str:
         if not images:
             return ""
@@ -357,11 +467,79 @@ class Plugin(Star):
             return ""
         lines = ["\\section*{PDF 附件}"]
         for pdf in pdfs:
-            reference = pdf.path or pdf.url or pdf.name
-            if not reference:
+            source = pdf.path or pdf.url or pdf.name
+            if not source:
                 continue
-            lines.append(f"\\noindent 附件：{self._escape_tex(reference)}\\\\")
+            extracted_text = self._extract_pdf_text(source)
+            if extracted_text:
+                lines.append("\\subsection*{PDF 文本}")
+                lines.append(self._escape_tex(extracted_text[:6000]))
+            else:
+                lines.append(f"\\noindent 附件：{self._escape_tex(source)}\\\\")
         return "\n".join(lines) + "\n"
+
+    def _extract_pdf_text(self, source: str) -> str:
+        local_source = source.replace("file://", "")
+        if not local_source or not os.path.exists(local_source):
+            return ""
+        if shutil.which("pdftotext") is not None:
+            try:
+                result = subprocess.run(
+                    ["pdftotext", "-layout", local_source, "-"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except Exception:
+                result = None
+            else:
+                text = (result.stdout or "").strip()
+                if text:
+                    return text
+        return self._ocr_pdf_or_image(local_source)
+
+    def _ocr_pdf_or_image(self, local_source: str) -> str:
+        tesseract = shutil.which("tesseract")
+        if tesseract is None:
+            return ""
+
+        suffix = Path(local_source).suffix.lower()
+        if suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}:
+            return self._ocr_image(local_source, tesseract)
+        if suffix != ".pdf":
+            return ""
+
+        pdftoppm = shutil.which("pdftoppm")
+        if pdftoppm is None:
+            return ""
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="xelatex_ocr_"))
+        try:
+            prefix = temp_dir / "page"
+            subprocess.run(
+                [pdftoppm, "-png", "-singlefile", local_source, str(prefix)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            image_path = temp_dir / "page.png"
+            if not image_path.exists():
+                return ""
+            return self._ocr_image(str(image_path), tesseract)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _ocr_image(self, image_path: str, tesseract: str) -> str:
+        try:
+            result = subprocess.run(
+                [tesseract, image_path, "stdout", "-l", os.environ.get("XELATEX_OCR_LANG", "chi_sim+eng")],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            return ""
+        return (result.stdout or "").strip()
 
     def _tex_file_reference(self, reference: str) -> str:
         return Path(reference.replace("file://", "")).as_posix()
@@ -384,7 +562,9 @@ class Plugin(Star):
         if not source:
             return attachment
 
-        target_suffix = Path(attachment.name or source).suffix or (".pdf" if attachment.kind == "pdf" else ".png")
+        target_suffix = Path(attachment.name or source).suffix or (
+            ".pdf" if attachment.kind == "pdf" else ".png"
+        )
         target_name = f"{attachment.kind}_{abs(hash(source))}{target_suffix}"
         target_path = self.asset_dir / target_name
 
@@ -410,9 +590,16 @@ class Plugin(Star):
 
     def _escape_tex(self, text: str) -> str:
         return (
-            text.replace("\\", r"\\textbackslash{}").replace("&", r"\\&").replace("%", r"\\%").replace("$", r"\\$")
-            .replace("#", r"\\#").replace("_", r"\\_").replace("{", r"\\{").replace("}", r"\\}")
-            .replace("~", r"\\textasciitilde{}").replace("^", r"\\textasciicircum{}")
+            text.replace("\\", r"\\textbackslash{}")
+            .replace("&", r"\\&")
+            .replace("%", r"\\%")
+            .replace("$", r"\\$")
+            .replace("#", r"\\#")
+            .replace("_", r"\\_")
+            .replace("{", r"\\{")
+            .replace("}", r"\\}")
+            .replace("~", r"\\textasciitilde{}")
+            .replace("^", r"\\textasciicircum{}")
         )
 
     def get_session_id(self, event: Any) -> str:
@@ -543,3 +730,63 @@ class Plugin(Star):
                 if stripped.startswith(tuple(self.command_aliases)):
                     return stripped
         return ""
+
+    def _extract_model_switch(self, text: str) -> Optional[str]:
+        stripped = text.strip()
+        patterns = [
+            r"^使用\s+(.+?)\s+模型回答$",
+            r"^切换到\s+(.+?)\s*模型$",
+            r"^用\s+(.+?)\s+模型回答$",
+        ]
+        for pattern in patterns:
+            match = re.match(pattern, stripped)
+            if match:
+                return match.group(1).strip()
+        return None
+
+    def _is_source_export_command(self, text: str) -> bool:
+        command = text.strip().split(maxsplit=1)[0] if text.strip() else ""
+        return command in {"/ai_source", "ai_source", "/源文件", "源文件"}
+
+    def _copy_to_export_dir(self, source_path: Path) -> Optional[Path]:
+        try:
+            export_path = self.export_dir / f"{source_path.stem}_{abs(hash(source_path.as_posix()))}{source_path.suffix}"
+            shutil.copyfile(source_path, export_path)
+            return export_path
+        except Exception:
+            return None
+
+    def _write_export_file(self, session_id: str, content: str, suffix: str) -> Path:
+        export_path = self.export_dir / f"{session_id}_{abs(hash(content))}{suffix}"
+        export_path.write_text(content, encoding="utf-8")
+        return export_path
+
+    def _public_file_url(self, exported_path: Path) -> str:
+        base = self.public_base_url.rstrip("/")
+        return f"{base}/{exported_path.relative_to(self.data_dir).as_posix()}"
+
+    def _start_file_server(self) -> None:
+        if self._file_server is not None:
+            return
+
+        handler_cls = self._build_file_handler()
+        try:
+            self._file_server = ThreadingHTTPServer((self.file_server_host, self.file_server_port), handler_cls)
+        except OSError:
+            self._file_server = None
+            return
+
+        self._file_server_thread = threading.Thread(target=self._file_server.serve_forever, daemon=True)
+        self._file_server_thread.start()
+
+    def _build_file_handler(self):
+        directory = str(self.data_dir)
+
+        class QuietHandler(SimpleHTTPRequestHandler):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, directory=directory, **kwargs)
+
+            def log_message(self, *_args: Any) -> None:
+                return
+
+        return QuietHandler
