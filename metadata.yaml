@@ -1,0 +1,7 @@
+name: astrbot_plugin_xelatex_pdf
+display_name: XeLaTeX PDF
+short_desc: 使用 XeLaTeX 重新实现 PDF 生成能力的 AstrBot 插件。
+description: 在保持原 PDF 插件功能目标不变的前提下，使用 XeLaTeX 作为新的 PDF 编译渲染后端。
+version: 0.1.0
+author: CodeBuddy
+astrbot_version: ">=4.16,<5"

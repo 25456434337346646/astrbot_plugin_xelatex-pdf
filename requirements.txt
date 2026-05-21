@@ -1,0 +1,2 @@
+# Python dependencies for astrbot_plugin_xelatex_pdf
+# Add runtime dependencies here when implementing the XeLaTeX pipeline.
