@@ -4,10 +4,13 @@ from dataclasses import dataclass, field
 import json
 import os
 import re
+import socket
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
+import urllib.parse
 import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -147,12 +150,10 @@ class Plugin(Star):
         self.config = config
         self.name = "astrbot_plugin_xelatex_pdf"
         self.initialized = False
-        self.data_dir = Path(tempfile.gettempdir()) / self.name
+        self.data_dir = Path("/AstrBot/data/pdf_reports") if Path("/AstrBot/data").exists() else Path(tempfile.gettempdir()) / "astrbot_plugin_xelatex_pdf"
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.asset_dir = self.data_dir / "assets"
-        self.asset_dir.mkdir(parents=True, exist_ok=True)
-        self.export_dir = self.data_dir / "exports"
-        self.export_dir.mkdir(parents=True, exist_ok=True)
+        self.asset_dir = self.data_dir
+        self.export_dir = self.data_dir
         self.history_file = self.data_dir / "chat_history.json"
         self.max_history_rounds = 5
         self.chat_history = self._load_history()
@@ -175,10 +176,8 @@ class Plugin(Star):
             latexmk=shutil.which("latexmk"),
             pdflatex=shutil.which("pdflatex"),
         )
-        self.file_server_port = int(self._get_config_value("file_server_port", "XELATEX_FILE_PORT", "8765"))
-        self.file_server_host = self._get_config_value("file_server_host", "XELATEX_FILE_HOST", "0.0.0.0")
-        public_base_url = self._get_config_value("public_base_url", "XELATEX_PUBLIC_BASE_URL", "")
-        self.public_base_url = (public_base_url or f"http://127.0.0.1:{self.file_server_port}").rstrip("/")
+        self.file_server_port = 8765
+        self.file_server_host = "0.0.0.0"
         self._file_server: ThreadingHTTPServer | None = None
         self._file_server_thread: threading.Thread | None = None
         self._start_file_server()
@@ -199,7 +198,7 @@ class Plugin(Star):
             "active_model": self.active_model_name,
             "available_models": self.available_models,
             "text_api_configured": bool(self.text_api_url),
-            "file_server": self.public_base_url,
+            "file_server": f"http://{socket.gethostname()}:{self.file_server_port}/pdf/{{filename}}",
         }
 
     @filter.command("ai", alias={"ask", "解答", "解析"})
@@ -816,20 +815,23 @@ class Plugin(Star):
 
     def _copy_to_export_dir(self, source_path: Path) -> Optional[Path]:
         try:
-            export_path = self.export_dir / f"{source_path.stem}_{abs(hash(source_path.as_posix()))}{source_path.suffix}"
+            export_path = self.export_dir / f"report_{int(time.time())}{source_path.suffix}"
             shutil.copyfile(source_path, export_path)
             return export_path
         except Exception:
             return None
 
     def _write_export_file(self, session_id: str, content: str, suffix: str) -> Path:
-        export_path = self.export_dir / f"{session_id}_{abs(hash(content))}{suffix}"
+        export_path = self.export_dir / f"source_{session_id}_{abs(hash(content))}{suffix}"
         export_path.write_text(content, encoding="utf-8")
         return export_path
 
     def _public_file_url(self, exported_path: Path) -> str:
-        base = self.public_base_url.rstrip("/")
-        return f"{base}/{exported_path.relative_to(self.data_dir).as_posix()}"
+        filename = exported_path.name
+        hostname = socket.gethostname()
+        if hostname and not hostname.startswith("localhost"):
+            return f"http://{hostname}:{self.file_server_port}/pdf/{filename}"
+        return f"http://127.0.0.1:{self.file_server_port}/pdf/{filename}"
 
     def _start_file_server(self) -> None:
         if self._file_server is not None:
@@ -846,11 +848,31 @@ class Plugin(Star):
         self._file_server_thread.start()
 
     def _build_file_handler(self):
-        directory = str(self.data_dir)
+        data_dir = self.data_dir
 
         class QuietHandler(SimpleHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if not self.path.startswith("/pdf/"):
+                    self.send_error(404, "File not found")
+                    return
+                filename = urllib.parse.unquote(self.path.removeprefix("/pdf/").split("?", 1)[0])
+                if not filename or "/" in filename or "\\" in filename:
+                    self.send_error(404, "File not found")
+                    return
+                file_path = data_dir / filename
+                if not file_path.is_file():
+                    self.send_error(404, "File not found")
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", self.guess_type(str(file_path)))
+                self.send_header("Content-Disposition", f'inline; filename="{filename}"')
+                self.send_header("Content-Length", str(file_path.stat().st_size))
+                self.end_headers()
+                with file_path.open("rb") as file_obj:
+                    shutil.copyfileobj(file_obj, self.wfile)
+
             def __init__(self, *args: Any, **kwargs: Any) -> None:
-                super().__init__(*args, directory=directory, **kwargs)
+                super().__init__(*args, directory=str(data_dir), **kwargs)
 
             def log_message(self, *_args: Any) -> None:
                 return

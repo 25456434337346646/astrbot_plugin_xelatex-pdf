@@ -1,5 +1,13 @@
 # 开发日志
 
+## 0.2.0
+
+- 简化配置项：移除 `file_server_host`、`file_server_port`、`public_base_url`，改为自动检测
+- 优化文件命名：PDF 输出使用时间戳命名（`report_时间戳.pdf`），源文件使用 `source_` 前缀
+- 数据目录适配 Docker：优先使用 `/AstrBot/data/pdf_reports`，本地环境回退到系统临时目录
+- 明确模型默认值：`text_api_url` 默认 DeepSeek，`llm_model` 默认 `deepseek-chat`，`llm_vision_model` 默认 `qwen-vl-max`
+- 简化 `fallback_models` 和 `fallback_vision_models` 配置说明
+
 ## 0.1.0
 
 - 创建 `astrbot_plugin_xelatex_pdf` 插件骨架
