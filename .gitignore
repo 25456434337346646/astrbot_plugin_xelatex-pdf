@@ -1,9 +1,12 @@
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
 .env
 .env.*
+*.bak
 *.log
