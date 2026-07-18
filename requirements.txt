@@ -1,2 +1,3 @@
-# Python dependencies for astrbot_plugin_xelatex_pdf
-# Add runtime dependencies here when implementing the XeLaTeX pipeline.
+# No required third-party Python packages.
+# PDF page rendering uses PyMuPDF when AstrBot provides it, then falls back to
+# the pdftoppm executable from poppler-utils.

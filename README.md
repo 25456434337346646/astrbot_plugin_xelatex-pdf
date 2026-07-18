@@ -1,67 +1,81 @@
 # astrbot_plugin_xelatex_pdf
 
-AstrBot 的 XeLaTeX PDF 生成插件，使用 XeLaTeX 作为 PDF 渲染后端，支持中文排版。
+AstrBot 的多模态问答 PDF 插件。它接收文本、引用消息、图片或 PDF，调用
+OpenAI 兼容的文本/视觉模型生成结构化答案，再通过 XeLaTeX 和 ElegantBook
+渲染为中文 PDF。
 
-## 功能特性
+## 功能
 
-- 支持 `/ai`、`/ask`、`/解答`、`/解析` 命令触发 PDF 生成
-- 支持文本、Reply 消息、图片、PDF 文件作为输入
-- 内置 HTTP 文件服务，生成的 PDF 可直接通过链接访问
-- 支持多模型切换和备用模型自动降级
-- 支持视觉模型（OCR）识别图片内容
-- 自动保存最近 5 轮会话记忆
-- 编译失败时返回错误日志摘要
+- `/ai`、`/ask`、`/解答`、`/解析` 多个命令入口
+- 解析普通附件及 QQ Reply 中的文本、图片和 PDF
+- PDF 转图片后交给视觉模型，失败时回退到本地文本提取/OCR
+- 文本模型和视觉模型均支持备用模型自动降级
+- 将 Markdown、公式和常用 ElegantBook 环境转换为可编译文档
+- 保存最近 5 轮会话，并支持导出上一次生成的 LaTeX 源文件
+- 通过内置 HTTP 文件服务向消息适配器回传 PDF
 
-## 命令列表
+## 命令
 
-| 命令 | 别名 | 说明 |
-|------|------|------|
-| `/ai <内容>` | `/ask`、`/解答`、`/解析` | 触发 AI 分析并生成 PDF |
-| `/查模型` | - | 查看当前可用模型列表 |
-| `/ai_source` | `/源文件` | 导出当前会话的 LaTeX 源文件 |
+| 命令 | 说明 |
+| --- | --- |
+| `/ai <问题>` | 生成回答并编译 PDF；别名为 `/ask`、`/解答`、`/解析` |
+| `/ai clear` | 清空当前会话历史 |
+| `/ai -m <模型>` | 切换当前文本模型 |
+| `/查模型` | 查询接口可用模型 |
+| `/ai_source` | 导出当前会话的 LaTeX 源文件；别名为 `/源文件` |
 
-## 配置项
+也可以发送“切换到 `<模型>` 模型”或“使用 `<模型>` 模型回答”。
 
-在 AstrBot 插件管理页面中配置以下参数：
+## 配置
 
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `text_api_url` | 逻辑大脑接口地址（OpenAI 兼容） | `https://api.deepseek.com/v1` |
-| `text_api_key` | API 密钥 | - |
-| `llm_model` | 文本对话模型 | `deepseek-chat` |
-| `llm_vision_model` | 视觉识别模型 | `qwen-vl-max` |
-| `fallback_models` | 备用文本模型列表（逗号分隔） | - |
-| `fallback_vision_models` | 备用视觉模型列表（逗号分隔） | - |
+| 配置项 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `text_api_url` | 是 | `https://api.deepseek.com/v1` | OpenAI 兼容的文本接口根地址 |
+| `text_api_key` | 是 | 空 | 文本接口密钥 |
+| `llm_model` | 是 | `deepseek-chat` | 首选文本模型 |
+| `fallback_models` | 否 | 空 | 逗号分隔的备用文本模型 |
+| `ocr_api_url` | 否 | `text_api_url` | 独立的视觉接口根地址 |
+| `ocr_api_key` | 否 | `text_api_key` | 独立的视觉接口密钥 |
+| `llm_vision_model` | 图片/PDF 输入时 | `qwen-vl-max` | 首选视觉模型 |
+| `fallback_vision_models` | 否 | 空 | 逗号分隔的备用视觉模型 |
 
-## 运行环境要求
+密钥只应保存在 AstrBot 插件配置或环境变量中，不要提交到仓库。
 
-插件运行环境需要安装 TeX 编译链：
+## 运行环境
+
+- AstrBot `>=4.16,<5`
+- Python 3.10+
+- `xelatex` 和 ElegantBook 所需的 TeX Live 宏包
+- 中文字体
+- PDF 输入建议安装 PyMuPDF，或提供 `pdftoppm`/`pdftotext`
+- 本地 OCR 回退需要 `tesseract` 及相应语言包
+
+Debian/Ubuntu 可按需安装：
 
 ```bash
-# Ubuntu/Debian
-apt-get install texlive-xetex texlive-lang-chinese latexmk
-
-# 需要中文字体（如 SimSun、SimHei、FangSong 等）
+apt-get install texlive-xetex texlive-lang-chinese latexmk poppler-utils tesseract-ocr
 ```
 
-## 数据存储
+插件在 Docker 中使用 `/AstrBot/data/pdf_reports/` 保存导出文件和会话历史；
+其他环境使用系统临时目录。内置文件服务监听 `8765` 端口，部署时需确保消息
+适配器能够访问容器返回的地址。
 
-- **Docker 环境**：数据存储在 `/AstrBot/data/pdf_reports/`
-- **本地环境**：数据存储在系统临时目录的 `astrbot_plugin_xelatex_pdf/` 下
+## 安装
 
-生成的 PDF 文件和会话历史均保存在数据目录中。
+在 AstrBot 插件管理页面选择从 GitHub 安装，并填写：
 
-## 安装方式
+```text
+https://github.com/25456434337346646/astrbot_plugin_xelatex-pdf
+```
 
-1. 在 AstrBot 插件管理页面中选择「从 GitHub 安装」
-2. 输入仓库地址：`https://github.com/25456434337346646/astrbot_plugin_xelatex-pdf`
-3. 安装后在配置页面填写 API 密钥和模型信息
+仓库内附带基于 ElegantBook 4.3 修改并按 LPPL 要求改名的
+`astrbot-elegantbook.cls`，其来源、修改说明和许可证见
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-## 开发日志
+## 开发验证
 
-详见 [CHANGELOG.md](CHANGELOG.md)
-
-## 相关链接
-
-- [AstrBot 官方文档](https://astrbot.app/)
-- [AstrBot 插件开发指南](https://astrbot.app/plugin/)
+```bash
+ruff check main.py tests
+python -m compileall -q main.py tests
+python -m unittest discover -s tests -v
+```

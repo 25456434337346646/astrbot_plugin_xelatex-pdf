@@ -1,30 +1,25 @@
-# 开发日志
+# 更新日志
+
+## 0.3.0
+
+- 接入 OpenAI 兼容的文本模型与视觉模型问答链路
+- 支持 QQ Reply、普通图片和 PDF 附件的提取、本地化与 OCR
+- 使用 ElegantBook 派生模板生成结构化中文 PDF，并按 LPPL 要求改名后随插件分发
+- 修复同一附件上下文触发两次 OCR 请求的问题
+- 修复 Reply 自带文本时跳过引用附件的问题
+- 将网络、OCR 和 XeLaTeX 工作移出异步事件循环
+- 为附件大小、PDF OCR 页数、网络请求和外部进程增加上限与超时
+- 增加安全的导出文件名、编译目录清理、文件服务关闭钩子、单元测试和 GitHub Actions CI
 
 ## 0.2.0
 
-- 简化配置项：移除 `file_server_host`、`file_server_port`、`public_base_url`，改为自动检测
-- 优化文件命名：PDF 输出使用时间戳命名（`report_时间戳.pdf`），源文件使用 `source_` 前缀
-- 数据目录适配 Docker：优先使用 `/AstrBot/data/pdf_reports`，本地环境回退到系统临时目录
-- 明确模型默认值：`text_api_url` 默认 DeepSeek，`llm_model` 默认 `deepseek-chat`，`llm_vision_model` 默认 `qwen-vl-max`
-- 简化 `fallback_models` 和 `fallback_vision_models` 配置说明
+- 简化配置项，文件服务地址改为自动检测
+- PDF 和源文件使用时间戳/会话信息命名
+- Docker 环境使用 `/AstrBot/data/pdf_reports` 数据目录
+- 明确文本、视觉及备用模型默认配置
 
 ## 0.1.0
 
-- 创建 `astrbot_plugin_xelatex_pdf` 插件骨架
-- 添加 AstrBot `@register` 插件注册
-- 添加 `/ai`、`/ask`、`/解答`、`/解析` 命令入口
-- 添加消息解析结构：文本、Reply、图片、PDF
-- 添加图片 / PDF 附件本地化处理
-- 添加 XeLaTeX 编译入口
-- 添加编译失败日志摘要返回
-- 添加最近 5 轮会话记忆骨架
-- 添加本地开发环境 fallback，便于脱离 AstrBot 做语法检查
-
-## 待办
-
-- 在 AstrBot Docker 容器内安装 TeX 编译链
-- 使用真实 AstrBot 事件对象测试 `/ai`
-- 完善 PDF 文件 HTTP 服务回传方式
-- 完善图片路径、远程图片下载和 TeX 编译兼容性
-- 完善 PDF 内容提取或 OCR 流程
-- 接入真实 LLM 内容生成链路
+- 创建 AstrBot 插件骨架和命令入口
+- 添加文本、Reply、图片及 PDF 输入结构
+- 添加 XeLaTeX 编译、错误摘要和会话记忆基础能力

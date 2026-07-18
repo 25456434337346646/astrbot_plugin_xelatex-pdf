@@ -1,19 +1,32 @@
 {
     "text_api_url": {
-        "description": "逻辑大脑（文本）接口地址",
+        "description": "文本接口地址",
         "type": "string",
         "hint": "用于文本生成的接口地址，例如 https://api.deepseek.com/v1",
         "default": "https://api.deepseek.com/v1"
     },
     "text_api_key": {
-        "description": "逻辑大脑（文本）API Key",
+        "description": "文本 API Key",
         "type": "string",
-        "hint": "用于逻辑分析模型的 API 密钥",
+        "hint": "用于文本生成模型的 API 密钥",
+        "obvious_hint": true,
+        "default": ""
+    },
+    "ocr_api_url": {
+        "description": "OCR/视觉接口地址",
+        "type": "string",
+        "hint": "选填。用于视觉模型识别的接口地址；留空时回退使用 text_api_url",
+        "default": ""
+    },
+    "ocr_api_key": {
+        "description": "OCR/视觉 API Key",
+        "type": "string",
+        "hint": "选填。用于视觉模型识别的 API 密钥；留空时回退使用 text_api_key",
         "obvious_hint": true,
         "default": ""
     },
     "llm_model": {
-        "description": "逻辑大脑模型名称",
+        "description": "文本模型名称",
         "type": "string",
         "hint": "文本对话模型，例如 deepseek-chat",
         "default": "deepseek-chat"
@@ -27,7 +40,7 @@
     "fallback_models": {
         "description": "备用文本模型列表 (逗号分隔)",
         "type": "string",
-        "hint": "当主逻辑模型超时或失败时，依次尝试这些模型。例如: gpt-4o,claude-3-5-sonnet",
+        "hint": "当主文本模型超时或失败时，依次尝试这些模型。例如: gpt-4o,claude-3-5-sonnet",
         "default": ""
     },
     "fallback_vision_models": {
