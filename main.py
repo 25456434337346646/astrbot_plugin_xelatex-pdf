@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.5.0"
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_OCR_IMAGE_BYTES = 15 * 1024 * 1024
 MAX_OCR_PAGES = 12
@@ -167,13 +167,22 @@ class Plugin(Star):
         self.initialized = False
         self.data_dir = Path("/AstrBot/data/pdf_reports") if Path("/AstrBot/data").exists() else Path(tempfile.gettempdir()) / "astrbot_plugin_xelatex_pdf"
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.asset_dir = self.data_dir
-        self.export_dir = self.data_dir
+        # 分类目录：附件 / LaTeX 源码 / 编译日志 / PDF 各自独立，存储结构清晰有序
+        self.asset_dir = self.data_dir / "assets"
+        self.source_dir = self.data_dir / "sources"
+        self.log_dir = self.data_dir / "logs"
+        self.pdf_dir = self.data_dir / "pdfs"
+        for category_dir in (self.asset_dir, self.source_dir, self.log_dir, self.pdf_dir):
+            category_dir.mkdir(parents=True, exist_ok=True)
+        # export_dir 指向 PDF 分类目录，保持与既有文件回传链路兼容
+        self.export_dir = self.pdf_dir
         self.history_file = self.data_dir / "chat_history.json"
         self.max_history_rounds = 5
         self.chat_history = self._load_history()
         self.last_tex_source_by_session: dict[str, str] = {}
         self.last_pdf_by_session: dict[str, Path] = {}
+        # 记录每个会话最近一次生成的命名基名，保证源码/日志/PDF 三类文件同名对应
+        self.last_base_name_by_session: dict[str, str] = {}
         self.text_api_url = self._get_config_value("text_api_url", "XELATEX_TEXT_API_URL", "").rstrip("/")
         self.text_api_key = self._get_config_value("text_api_key", "XELATEX_TEXT_API_KEY", "")
         self.ocr_api_url = self._get_config_value("ocr_api_url", "XELATEX_OCR_API_URL", self.text_api_url).rstrip("/")
@@ -193,8 +202,11 @@ class Plugin(Star):
             latexmk=shutil.which("latexmk"),
             pdflatex=shutil.which("pdflatex"),
         )
-        self.file_server_port = 8765
+        self.file_server_port = int(self._get_config_value("file_server_port", "XELATEX_FILE_SERVER_PORT", "8765") or 8765)
         self.file_server_host = "0.0.0.0"
+        # 回传下载链接使用的 host；留空时自动探测容器主机名。
+        # 机器人与插件同宿主机但插件在容器内时，应配置为 127.0.0.1 并在 Docker 映射端口。
+        self.public_file_host = self._get_config_value("file_server_host", "XELATEX_FILE_SERVER_HOST", "")
         self._file_server: ThreadingHTTPServer | None = None
         self._file_server_thread: threading.Thread | None = None
         self._start_file_server()
@@ -320,22 +332,32 @@ class Plugin(Star):
         )
         self._set_active_model(used_model)
         question_text = self._extract_user_question(command_text)
+        # 解析 LLM 返回的 [TITLE]/[SUMMARY] 结构化标记，标题与提要由模型生成
+        structured = self._parse_structured_answer(answer_text)
         tex_source = await asyncio.to_thread(
             self.build_tex_source,
             parsed_message,
-            body_override=answer_text,
+            body_override=structured["body"],
             question_text=question_text,
+            title_override=structured["title"],
+            summary_override=structured["summary"],
         )
         self.last_tex_source_by_session[session_id] = tex_source
+        # 统一命名：QQ号_题目关键词_时间戳；源码/日志/PDF 三类文件共用同一基名
+        qq_number = self._extract_qq_number(event)
+        base_name = self._build_base_name(qq_number, question_text)
+        self.last_base_name_by_session[session_id] = base_name
+        await asyncio.to_thread(self._persist_tex_source, base_name, tex_source)
         response = await asyncio.to_thread(
             self.handle_command,
             command_text,
             tex_source=tex_source,
             session_id=session_id,
+            base_name=base_name,
         )
 
         if response.success and response.compile_result and response.compile_result.success:
-            self.append_history(session_id, question_text, answer_text)
+            self.append_history(session_id, question_text, structured["body"])
             if response.file_payload and response.file_payload.get("path"):
                 self.last_pdf_by_session[session_id] = Path(response.file_payload["path"])
 
@@ -391,7 +413,7 @@ class Plugin(Star):
 
         return CommandRequest(command=command, args=parts[1:], raw_text=stripped)
 
-    def handle_command(self, text: str, tex_source: Optional[str] = None, session_id: str = "default") -> CommandResponse:
+    def handle_command(self, text: str, tex_source: Optional[str] = None, session_id: str = "default", base_name: Optional[str] = None) -> CommandResponse:
         request = self.parse_command(text)
         if request is None:
             return CommandResponse(success=False, message="未识别的命令")
@@ -403,7 +425,9 @@ class Plugin(Star):
             source = self.last_tex_source_by_session.get(session_id)
             if not source:
                 return CommandResponse(success=False, message="当前会话没有可导出的源文件")
-            source_path = self._write_export_file(session_id, source, ".tex")
+            # 与本次 PDF 共用同一「QQ号_题目关键词」基名，保证三类文件一一对应
+            base_name = self.last_base_name_by_session.get(session_id) or session_id
+            source_path = self._persist_tex_source(base_name, source)
             return CommandResponse(
                 success=True,
                 message="已导出源文件",
@@ -426,19 +450,19 @@ class Plugin(Star):
 
         compile_result = self.compile_tex(tex_source)
         if compile_result.success:
-            file_payload = self.build_file_payload(compile_result.pdf_path)
+            file_payload = self.build_file_payload(compile_result.pdf_path, base_name=base_name)
             if file_payload is None or not file_payload.get("path"):
                 compile_result.success = False
                 compile_result.stderr = "PDF 已编译，但无法复制到导出目录"
                 message = self.build_compile_error_message(compile_result)
-                self._cleanup_compile_result(compile_result)
+                self._cleanup_compile_result(compile_result, base_name=base_name)
                 return CommandResponse(
                     success=False,
                     message=message,
                     compile_result=compile_result,
                 )
             exported_path = Path(file_payload["path"])
-            self._cleanup_compile_result(compile_result, exported_path=exported_path)
+            self._cleanup_compile_result(compile_result, exported_path=exported_path, base_name=base_name)
             return CommandResponse(
                 success=True,
                 message="编译成功",
@@ -446,20 +470,36 @@ class Plugin(Star):
                 file_payload=file_payload,
             )
         message = self.build_compile_error_message(compile_result)
-        self._cleanup_compile_result(compile_result)
+        self._cleanup_compile_result(compile_result, base_name=base_name)
         return CommandResponse(
             success=False,
             message=message,
             compile_result=compile_result,
         )
 
-    def _cleanup_compile_result(self, compile_result: CompileResult, exported_path: Optional[Path] = None) -> None:
+    def _cleanup_compile_result(self, compile_result: CompileResult, exported_path: Optional[Path] = None, base_name: Optional[str] = None) -> None:
+        # 删除临时工作目录前，先把编译日志按统一命名归档到 logs/ 分类目录
+        self._archive_compile_log(compile_result, base_name)
         workdir_path = compile_result.workdir_path
         if workdir_path is not None:
             shutil.rmtree(workdir_path, ignore_errors=True)
         compile_result.workdir_path = None
         compile_result.log_path = None
         compile_result.pdf_path = exported_path
+
+    def _archive_compile_log(self, compile_result: CompileResult, base_name: Optional[str] = None) -> None:
+        log_path = compile_result.log_path
+        if log_path is None or not Path(log_path).exists():
+            return
+        log_dir = getattr(self, "log_dir", None)
+        if log_dir is None:
+            return
+        name = self._safe_filename_component(base_name or "compile", default="compile")
+        target = Path(log_dir) / f"{name}.log"
+        try:
+            shutil.copyfile(log_path, target)
+        except OSError:
+            return
 
     def _cleanup_stale_workdirs(self) -> None:
         temp_root = Path(tempfile.gettempdir()).resolve()
@@ -604,22 +644,44 @@ class Plugin(Star):
             return fallback_class
         return None
 
-    def build_file_payload(self, pdf_path: Optional[Path]) -> Optional[dict[str, Any]]:
-        if pdf_path is None:
+    def build_file_payload(self, file_path: Optional[Path], base_name: Optional[str] = None) -> Optional[dict[str, Any]]:
+        if file_path is None:
             return None
-        try:
-            already_exported = pdf_path.resolve().parent == self.export_dir.resolve()
-        except OSError:
-            already_exported = False
-        exported_path = pdf_path if already_exported else self._copy_to_export_dir(pdf_path)
-        if exported_path is None:
-            return None
+        file_path = Path(file_path)
+        # 已落在任一分类目录内的文件直接回传；临时目录产物先复制到 PDF 分类目录
+        if not self._is_managed_path(file_path):
+            copied = self._copy_to_export_dir(file_path, base_name=base_name)
+            if copied is None:
+                return None
+            file_path = copied
         return {
             "type": "file",
-            "name": exported_path.name,
-            "path": str(exported_path),
-            "url": self._public_file_url(exported_path),
+            "name": file_path.name,
+            "path": str(file_path),
+            "url": self._public_file_url(file_path),
         }
+
+    def _is_managed_path(self, file_path: Path) -> bool:
+        try:
+            resolved_parent = file_path.resolve().parent
+        except OSError:
+            return False
+        managed_dirs = [
+            getattr(self, "data_dir", None),
+            getattr(self, "pdf_dir", None),
+            getattr(self, "source_dir", None),
+            getattr(self, "log_dir", None),
+            getattr(self, "asset_dir", None),
+        ]
+        for managed_dir in managed_dirs:
+            if managed_dir is None:
+                continue
+            try:
+                if resolved_parent == Path(managed_dir).resolve():
+                    return True
+            except OSError:
+                continue
+        return False
 
     def _is_diagram_request(self, question: str, parsed_message: ParsedMessage) -> bool:
         text = f"{question}\n{parsed_message.text}\n{parsed_message.reply_text}"
@@ -664,14 +726,17 @@ class Plugin(Star):
                 "content": (
                     "你是一个严谨、简洁的中文学术助手。你的回答会被程序转换并插入 ElegantBook LaTeX 模板的正文区域。"
                     "请输出适合 ElegantBook 正文排版的 Markdown/LaTeX 片段，而不是完整 LaTeX 文档。"
-                    "结构要求：使用清晰标题、短段落、项目列表和必要公式；标题使用 Markdown 的 #、##、### 等层级即可。"
+                    "输出格式（必须严格遵守）：第一行写 [TITLE] 加一个简短的文档标题（15 字以内，概括本次内容，不要书名号）；"
+                    "第二行写 [SUMMARY] 加一两句内容提要（概括核心问题、方法与结论，60 字以内）；"
+                    "之后空一行，直接输出正文。不要输出其他标记或解释。"
+                    "结构要求：正文使用清晰标题、短段落、项目列表和必要公式；标题使用 Markdown 的 #、##、### 等层级即可。"
                     "ElegantBook 环境要求：遇到定义、定理、性质、例题、注、笔记、证明、解答时，优先直接使用对应环境："
                     "\\begin{definition}...\\end{definition}、\\begin{theorem}...\\end{theorem}、\\begin{property}...\\end{property}、"
                     "\\begin{example}...\\end{example}、\\begin{remark}...\\end{remark}、\\begin{note}...\\end{note}、"
                     "\\begin{proof}...\\end{proof}、\\begin{solution}...\\end{solution}。"
                     "也可以用 Markdown 标题写“## 定义”“#### 例 1”“#### 注”等，外部程序会自动转换为 ElegantBook 环境。"
                     "数学要求：行内公式优先使用 \\(...\\) 或 $...$；行间公式使用 \\[...\\] 或 $$...$$；可使用 amsmath/amsfonts/amssymb 常见命令，如 \\mathbb、\\varepsilon、\\delta、\\Rightarrow。"
-                    "内容要求：直接回答用户问题，不要寒暄，不要说“下面是”。"
+                    "内容要求：直接回答用户问题，不要寒暄，不要说“下面是”。标题与提要必须根据本次回答的实际内容撰写，不要写空话套话。"
                     "禁止输出：\\documentclass、\\begin{document}、\\end{document}、\\usepackage、\\author、\\date、\\maketitle、页眉页脚设置、模型名、回答时间、作者信息。"
                     "不要把模型名或回答时间放在正文开头；这些元信息由外部模板写入页脚。"
                 ),
@@ -941,7 +1006,32 @@ class Plugin(Star):
                     parts.append("图片附件（OCR 未取到结果）：" + "，".join(names))
         return "\n\n".join(parts)
 
-    def build_tex_source(self, parsed_message: ParsedMessage, body_override: Optional[str] = None, question_text: str = "") -> str:
+    def _parse_structured_answer(self, answer_text: str) -> dict[str, str]:
+        """解析 LLM 返回的 [TITLE]/[SUMMARY] 结构化标记。
+
+        返回 {"title", "summary", "body"}。标记缺失或解析失败时对应字段为空，
+        由调用方决定降级策略（标题回退问题截取、提要盒省略），不伪造内容。
+        """
+        title = ""
+        summary = ""
+        body_lines: list[str] = []
+        for line in (answer_text or "").splitlines():
+            stripped = line.strip()
+            if not title and stripped.startswith("[TITLE]"):
+                title = stripped.removeprefix("[TITLE]").strip()
+                continue
+            if not summary and stripped.startswith("[SUMMARY]"):
+                summary = stripped.removeprefix("[SUMMARY]").strip()
+                continue
+            body_lines.append(line)
+        body = "\n".join(body_lines).strip()
+        return {
+            "title": title,
+            "summary": summary,
+            "body": body or (answer_text or "").strip(),
+        }
+
+    def build_tex_source(self, parsed_message: ParsedMessage, body_override: Optional[str] = None, question_text: str = "", title_override: Optional[str] = None, summary_override: Optional[str] = None) -> str:
         if body_override is None:
             body_parts = [parsed_message.reply_text, parsed_message.text]
             body = "\n".join(part for part in body_parts if part).strip() or "请输入要编译的内容。"
@@ -951,11 +1041,18 @@ class Plugin(Star):
         pdf_block = self._build_pdf_block(parsed_message.pdfs)
         answer_model = self._escape_tex_metadata(self.active_model_name or "default")
         answer_time = self._escape_tex_metadata(time.strftime("%Y-%m-%d %H:%M:%S"))
-        title_text = self._escape_tex_metadata(self._build_document_title(question_text, body))
+        # 标题优先取 LLM 返回，缺失时回退问题截取；不再按关键词猜测分类标题
+        title_text = self._escape_tex_metadata((title_override or "").strip() or self._build_document_title(question_text, body))
         subtitle_text = self._escape_tex_metadata(self._build_document_subtitle(question_text))
-        summary_text = self._tex_inline(self._build_document_summary(question_text, body))
+        # 内容提要仅当 LLM 返回时才渲染，避免硬编码套话
+        summary_box = ""
+        if summary_override and summary_override.strip():
+            summary_box = (
+                "\\begin{answerabstractbox}\n"
+                "\\textbf{内容提要}\\quad " + self._tex_inline(summary_override.strip()) + "\n"
+                "\\end{answerabstractbox}\n"
+            )
         question_card = self._build_question_card(question_text)
-        insight_block = self._build_insight_block(question_text, body)
         return (
             "\\documentclass[lang=cn,11pt,color=blue,device=normal]{astrbot-elegantbook}\n"
             "\\usepackage{amsmath,amsfonts,amssymb}\n"
@@ -1009,11 +1106,8 @@ class Plugin(Star):
             "{\\color{answerprimary}\\rule{0.72\\textwidth}{1.1pt}}\\par\n"
             "\\end{center}\n"
             "\\vspace{0.5em}\n"
-            "\\begin{answerabstractbox}\n"
-            "\\textbf{内容提要}\\quad " + summary_text + "\n"
-            "\\end{answerabstractbox}\n"
+            f"{summary_box}"
             f"{question_card}"
-            f"{insight_block}"
             "\\vspace{0.5em}\n"
             f"{self._markdown_to_tex(body)}\n"
             f"{image_block}"
@@ -1022,14 +1116,9 @@ class Plugin(Star):
         )
 
     def _build_document_title(self, question_text: str, body: str) -> str:
+        # 标题回退策略：仅截取问题原文，不再按关键词猜测分类标题
         seed = (question_text or body or "智能回答").strip()
         normalized = re.sub(r"\s+", " ", seed)
-        if any(keyword in normalized for keyword in ("哈斯图", "偏序集", "整除关系")):
-            return "偏序集分析与哈斯图绘制"
-        if any(keyword in normalized for keyword in ("证明", "定理", "命题")):
-            return "数学证明与结构化解答"
-        if any(keyword in normalized for keyword in ("图", "TikZ", "tikzpicture", "Graphviz")):
-            return "图形生成与排版说明"
         title = normalized[:28].strip("，。；：,.!?！？ ")
         return title or "智能回答"
 
@@ -1039,16 +1128,6 @@ class Plugin(Star):
             return "ElegantBook 智能解答"
         snippet = question[:36].strip("，。；：,.!?！？ ")
         return f"围绕问题：{snippet}"
-
-    def _build_document_summary(self, question_text: str, body: str) -> str:
-        has_graphics = any(keyword in (question_text + "\n" + body) for keyword in ("tikzpicture", "哈斯图", "Graphviz", "图"))
-        summary_parts = ["本页整理本次问题的核心思路、结果与必要说明"]
-        if question_text.strip():
-            summary_parts.append("标题根据问题语义自动生成")
-        if has_graphics:
-            summary_parts.append("包含图形或图论相关内容时会优先保留原生图形渲染")
-        summary_parts.append("正文优先使用 ElegantBook 的解答、注记与示例风格")
-        return "；".join(summary_parts) + "。"
 
     def _build_question_card(self, question_text: str) -> str:
         question = (question_text or "").strip()
@@ -1060,15 +1139,6 @@ class Plugin(Star):
             "\\textbf{题目聚焦}\\quad " + escaped + "\n"
             "\\end{answerkeybox}\n"
         )
-
-    def _build_insight_block(self, question_text: str, body: str) -> str:
-        combined = (question_text + "\n" + body).strip()
-        notes: list[str] = []
-        if any(keyword in combined for keyword in ("哈斯图", "偏序集", "图论", "tikzpicture", "Graphviz")):
-            notes.append("\\begin{note}图形题：优先保留原生 TikZ/图环境，避免转义破坏布局。\\end{note}")
-        if any(keyword in combined for keyword in ("证明", "推导", "结论")):
-            notes.append("\\begin{note}证明题：建议先写结论，再展开关键推导。\\end{note}")
-        return "\n".join(notes) + ("\n" if notes else "")
 
     def _markdown_to_tex(self, text: str) -> str:
         text = self._normalize_latex_blocks(text)
@@ -2014,31 +2084,89 @@ class Plugin(Star):
         command = text.strip().split(maxsplit=1)[0] if text.strip() else ""
         return command in {"/ai_source", "ai_source", "/源文件", "源文件"}
 
-    def _copy_to_export_dir(self, source_path: Path) -> Optional[Path]:
+    def _copy_to_export_dir(self, source_path: Path, base_name: Optional[str] = None) -> Optional[Path]:
         try:
-            export_path = self.export_dir / f"report_{time.time_ns()}{source_path.suffix}"
+            self.export_dir.mkdir(parents=True, exist_ok=True)
+            if base_name:
+                name = self._safe_filename_component(base_name, default="report")
+                export_path = self.export_dir / f"{name}{source_path.suffix}"
+            else:
+                export_path = self.export_dir / f"report_{time.time_ns()}{source_path.suffix}"
             shutil.copyfile(source_path, export_path)
             return export_path
         except Exception:
             return None
 
-    def _write_export_file(self, session_id: str, content: str, suffix: str) -> Path:
-        safe_session_id = self._safe_filename_component(session_id, default="session")
-        content_digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:20]
-        export_path = self.export_dir / f"source_{safe_session_id}_{content_digest}{suffix}"
-        export_path.write_text(content, encoding="utf-8")
-        return export_path
+    def _extract_qq_number(self, event: Any) -> str:
+        """从事件中提取发送者 QQ 号，作为文件命名前缀。"""
+        if event is None:
+            return ""
+        message_obj = getattr(event, "message_obj", None)
+        sender = getattr(message_obj, "sender", None) if message_obj is not None else None
+        for source in (sender, event):
+            if source is None:
+                continue
+            for attr in ("user_id", "qq", "sender_id"):
+                value = getattr(source, attr, None)
+                if value:
+                    return str(value)
+        return ""
+
+    def _extract_question_keyword(self, question_text: str) -> str:
+        """从题目文本中提取简洁关键词，作为文件命名的可识别标识。"""
+        normalized = re.sub(r"\s+", "", question_text or "")
+        normalized = re.sub(r"^(ai|ask|解答|解析|/)+", "", normalized, flags=re.IGNORECASE)
+        cleaned = re.sub(r"[，。；：,.!?！？、()（）\[\]【】{}\"'`~!@#$%^&*+=|\\/<>]", "", normalized)
+        return cleaned[:16]
+
+    def _keyword_filename_component(self, value: str, default: str = "untitled") -> str:
+        """文件名安全化：保留中文、字母、数字、下划线与连字符。"""
+        normalized = re.sub(r"[^\w-]+", "_", str(value)).strip("_")
+        return normalized[:32] or default
+
+    def _build_base_name(self, qq_number: str, question_text: str) -> str:
+        """构建统一命名基名：QQ号_题目关键词_时间戳。源码/日志/PDF 共用。"""
+        qq_part = self._keyword_filename_component(qq_number, default="unknown")
+        keyword_part = self._keyword_filename_component(self._extract_question_keyword(question_text), default="untitled")
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        return f"{qq_part}_{keyword_part}_{timestamp}"
+
+    def _persist_tex_source(self, base_name: str, tex_source: str) -> Path:
+        """把源码文件按统一命名写入 sources/ 分类目录。"""
+        self.source_dir.mkdir(parents=True, exist_ok=True)
+        name = self._safe_filename_component(base_name, default="source")
+        source_path = self.source_dir / f"{name}.tex"
+        source_path.write_text(tex_source, encoding="utf-8")
+        return source_path
 
     def _safe_filename_component(self, value: str, default: str = "file") -> str:
-        normalized = re.sub(r"[^0-9A-Za-z._-]+", "_", str(value)).strip("._-")
+        normalized = re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", str(value)).strip("._-")
         return normalized[:64] or default
 
     def _public_file_url(self, exported_path: Path) -> str:
         filename = exported_path.name
-        hostname = socket.gethostname()
-        if hostname and not hostname.startswith("localhost"):
-            return f"http://{hostname}:{self.file_server_port}/pdf/{filename}"
-        return f"http://127.0.0.1:{self.file_server_port}/pdf/{filename}"
+        configured_host = (getattr(self, "public_file_host", "") or "").strip()
+        if configured_host:
+            host = configured_host
+        else:
+            hostname = socket.gethostname()
+            host = hostname if hostname and not hostname.startswith("localhost") else "127.0.0.1"
+        # 按文件所在分类目录选择 URL 前缀，与文件服务路由保持一致
+        try:
+            parent = exported_path.resolve().parent
+        except OSError:
+            parent = exported_path.parent
+        prefix = "pdf"
+        for category_prefix, category_dir in (("source", self.source_dir), ("log", self.log_dir)):
+            if category_dir is None:
+                continue
+            try:
+                if parent == Path(category_dir).resolve():
+                    prefix = category_prefix
+                    break
+            except OSError:
+                continue
+        return f"http://{host}:{self.file_server_port}/{prefix}/{filename}"
 
     def _start_file_server(self) -> None:
         if self._file_server is not None:
@@ -2055,31 +2183,50 @@ class Plugin(Star):
         self._file_server_thread.start()
 
     def _build_file_handler(self):
-        data_dir = self.data_dir
+        # 按分类目录路由：/pdf/ → pdfs/，/source/ → sources/，/log/ → logs/
+        category_dirs = {
+            "pdf": self.pdf_dir,
+            "source": self.source_dir,
+            "log": self.log_dir,
+        }
 
         class QuietHandler(SimpleHTTPRequestHandler):
             def do_GET(self) -> None:
-                if not self.path.startswith("/pdf/"):
+                category = None
+                for prefix, directory in category_dirs.items():
+                    if self.path.startswith(f"/{prefix}/"):
+                        category = (prefix, directory)
+                        break
+                if category is None:
                     self.send_error(404, "File not found")
                     return
-                filename = urllib.parse.unquote(self.path.removeprefix("/pdf/").split("?", 1)[0])
+                prefix, directory = category
+                filename = urllib.parse.unquote(self.path.removeprefix(f"/{prefix}/").split("?", 1)[0])
                 if not filename or "/" in filename or "\\" in filename:
                     self.send_error(404, "File not found")
                     return
-                file_path = data_dir / filename
+                file_path = directory / filename
                 if not file_path.is_file():
                     self.send_error(404, "File not found")
                     return
                 self.send_response(200)
                 self.send_header("Content-Type", self.guess_type(str(file_path)))
-                self.send_header("Content-Disposition", f'inline; filename="{filename}"')
+                # 文件名可能含中文：HTTP 头仅支持 latin-1，直接塞会抛
+                # UnicodeEncodeError 导致空响应。按 RFC 5987 用 filename* 编码，
+                # 同时提供 ASCII 回退的 filename 以兼容旧客户端。
+                ascii_fallback = filename.encode("ascii", errors="ignore").decode("ascii") or "download"
+                encoded = urllib.parse.quote(filename)
+                self.send_header(
+                    "Content-Disposition",
+                    f'inline; filename="{ascii_fallback}"; filename*=UTF-8\'\'{encoded}',
+                )
                 self.send_header("Content-Length", str(file_path.stat().st_size))
                 self.end_headers()
                 with file_path.open("rb") as file_obj:
                     shutil.copyfileobj(file_obj, self.wfile)
 
             def __init__(self, *args: Any, **kwargs: Any) -> None:
-                super().__init__(*args, directory=str(data_dir), **kwargs)
+                super().__init__(*args, directory=str(category_dirs["pdf"]), **kwargs)
 
             def log_message(self, *_args: Any) -> None:
                 return

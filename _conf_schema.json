@@ -48,5 +48,17 @@
         "type": "string",
         "hint": "当主视觉模型 (OCR) 超时或失败时，依次尝试这些模型。例如: gpt-4o,qwen-vl-plus",
         "default": ""
+    },
+    "file_server_host": {
+        "description": "文件服务对外地址",
+        "type": "string",
+        "hint": "回传下载链接使用的 host。插件运行在 Docker 容器内、机器人在宿主机时，填 127.0.0.1 并在 Docker 中映射 8765 端口；留空则自动使用容器主机名",
+        "default": ""
+    },
+    "file_server_port": {
+        "description": "文件服务端口",
+        "type": "int",
+        "hint": "内置文件服务监听端口，默认 8765",
+        "default": 8765
     }
 }

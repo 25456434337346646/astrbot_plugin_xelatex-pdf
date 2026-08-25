@@ -10,6 +10,7 @@ OpenAI 兼容的文本/视觉模型生成结构化答案，再通过 XeLaTeX 和
 - 解析普通附件及 QQ Reply 中的文本、图片和 PDF
 - PDF 转图片后交给视觉模型，失败时回退到本地文本提取/OCR
 - 文本模型和视觉模型均支持备用模型自动降级
+- 文档标题与内容提要由模型结构化返回（`[TITLE]`/`[SUMMARY]` 标记），非硬编码
 - 将 Markdown、公式和常用 ElegantBook 环境转换为可编译文档
 - 保存最近 5 轮会话，并支持导出上一次生成的 LaTeX 源文件
 - 通过内置 HTTP 文件服务向消息适配器回传 PDF
@@ -38,6 +39,8 @@ OpenAI 兼容的文本/视觉模型生成结构化答案，再通过 XeLaTeX 和
 | `ocr_api_key` | 否 | `text_api_key` | 独立的视觉接口密钥 |
 | `llm_vision_model` | 图片/PDF 输入时 | `qwen-vl-max` | 首选视觉模型 |
 | `fallback_vision_models` | 否 | 空 | 逗号分隔的备用视觉模型 |
+| `file_server_host` | 否 | 空（自动用容器主机名） | 下载链接使用的 host；容器内插件+宿主机机器人时填 `127.0.0.1` 并映射端口 |
+| `file_server_port` | 否 | `8765` | 内置文件服务端口 |
 
 密钥只应保存在 AstrBot 插件配置或环境变量中，不要提交到仓库。
 
@@ -50,15 +53,38 @@ OpenAI 兼容的文本/视觉模型生成结构化答案，再通过 XeLaTeX 和
 - PDF 输入建议安装 PyMuPDF，或提供 `pdftoppm`/`pdftotext`
 - 本地 OCR 回退需要 `tesseract` 及相应语言包
 
-Debian/Ubuntu 可按需安装：
+Debian/Ubuntu 可按需安装（ElegantBook 派生类还需要 `tex-gyre`/`fonts-texgyre` 字体、`extarrows`、`bbding`、`adforn`、`biblatex` 等，已含在下表）：
 
 ```bash
-apt-get install texlive-xetex texlive-lang-chinese latexmk poppler-utils tesseract-ocr
+apt-get install texlive-xetex texlive-lang-chinese texlive-latex-extra \
+  texlive-pictures texlive-fonts-recommended texlive-science \
+  texlive-fonts-extra texlive-bibtex-extra tex-gyre fonts-texgyre \
+  fonts-noto-cjk poppler-utils
 ```
 
-插件在 Docker 中使用 `/AstrBot/data/pdf_reports/` 保存导出文件和会话历史；
+> Docker 部署提示：容器内 `apt` 安装的依赖在容器重建后会丢失，建议把上述安装
+> 固化进自定义镜像（`FROM soulter/astrbot:latest` + `RUN apt-get install ...`）。
+
+插件在 Docker 中使用 `/AstrBot/data/pdf_reports/` 保存产物和会话历史；
 其他环境使用系统临时目录。内置文件服务监听 `8765` 端口，部署时需确保消息
 适配器能够访问容器返回的地址。
+
+## 命名与文件管理
+
+所有产物统一采用「QQ号_题目关键词_时间戳」命名，并按类别分目录存放：
+
+```text
+pdf_reports/
+├── assets/    # 消息附件（图片/PDF 本地化副本）
+├── sources/   # LaTeX 源码（.tex）
+├── logs/      # xelatex 编译日志（.log）
+├── pdfs/      # 最终 PDF 产物（.pdf）
+└── chat_history.json
+```
+
+同一次问答的源码、日志、PDF 共用同一命名基名（例如
+`123456789_证明根号2是无理数_20260825_125123`），保证三类文件一一对应。
+内置文件服务按分类路由：`/pdf/{filename}`、`/source/{filename}`、`/log/{filename}`。
 
 ## 安装
 
