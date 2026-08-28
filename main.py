@@ -5,7 +5,10 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
+import queue
+import random
 import re
 import socket
 import shutil
@@ -30,6 +33,17 @@ MODEL_TIMEOUT_SECONDS = 120
 VISION_TIMEOUT_SECONDS = 300
 PROCESS_TIMEOUT_SECONDS = 120
 STALE_WORKDIR_MAX_AGE_SECONDS = 24 * 60 * 60
+# 答疑归档回写题库（旁路链路）相关常量
+WRITEBACK_QUEUE_MAXSIZE = 64
+WRITEBACK_TIMEOUT_SECONDS = 15
+WRITEBACK_MAX_ATTEMPTS = 3
+WRITEBACK_RETRY_BASE_DELAY = 1.0
+TOKEN_EXPIRY_MARGIN_SECONDS = 60
+ARCHIVE_TYPE_WHITELIST = {"single", "multiple", "blank", "proof", "calc", "answer"}
+ARCHIVE_TAG_LIMIT = 20
+WRITEBACK_LOG_PREFIX = "[qbk]"
+
+logger = logging.getLogger("astrbot_plugin_xelatex_pdf")
 
 try:  # pragma: no cover - 运行在 AstrBot 环境时会走真实导入
     from astrbot.api import AstrBotConfig
@@ -143,6 +157,342 @@ class SessionMemory:
         self.rounds.clear()
 
 
+@dataclass(slots=True)
+class HttpResponse:
+    """传输层统一响应：HTTP 错误（4xx/5xx）也转成本对象返回，不抛异常。"""
+
+    status: int
+    body: dict[str, Any]
+
+
+class WritebackError(RuntimeError):
+    """回写链路的永久性失败。携带 HTTP status（网络层失败时为 None），
+    供上层记录日志与重试决策；可重试情形（网络错/429/5xx）在客户端内部消化，
+    抛到调用方时一律代表「不应再重试」。"""
+
+    def __init__(self, message: str, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+@dataclass(slots=True)
+class WritebackJob:
+    """回写队列元素：入队时刻冻结全部字段，worker 消费时不再依赖外部状态。"""
+
+    external_id: str
+    payload: dict[str, Any]
+    enqueued_at: float
+
+
+class HttpTransport:
+    """传输层当前实现：标准库 urllib，同步阻塞。
+
+    与 `_post_chat_completion` 的关键差异：HTTPError 被捕获并读取正文，
+    转成带 status 的 HttpResponse 返回（而不是直接抛 RuntimeError）——
+    这是上层重试矩阵能区分 401/429/5xx/4xx 的前提。网络层异常原样上抛。
+    升级传输层时整体替换本类即可，签名保持不变。
+    """
+
+    user_agent = f"astrbot-plugin-xelatex-pdf/{PLUGIN_VERSION}"
+
+    def post_json(self, url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int) -> HttpResponse:
+        """POST JSON 请求；4xx/5xx 转为 HttpResponse 返回，网络异常上抛。"""
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        merged_headers = {"Content-Type": "application/json", "User-Agent": self.user_agent}
+        merged_headers.update(headers)
+        return self._perform(url, encoded, merged_headers, timeout)
+
+    def post_form(self, url: str, form: dict[str, str], headers: dict[str, str], timeout: int) -> HttpResponse:
+        """application/x-www-form-urlencoded 请求（令牌端点专用）。"""
+        encoded = urllib.parse.urlencode(form).encode("utf-8")
+        merged_headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": self.user_agent}
+        merged_headers.update(headers)
+        return self._perform(url, encoded, merged_headers, timeout)
+
+    def _perform(self, url: str, encoded_body: bytes, headers: dict[str, str], timeout: int) -> HttpResponse:
+        request = urllib.request.Request(url, data=encoded_body, method="POST")
+        for key, value in headers.items():
+            request.add_header(key, value)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return HttpResponse(status=response.status, body=self._decode_body(response.read()))
+        except urllib.error.HTTPError as exc:
+            # 4xx/5xx 不抛异常：读取错误正文尽力解析为 JSON，交给上层决策
+            try:
+                raw_body = exc.read()
+            except Exception:
+                raw_body = b""
+            return HttpResponse(status=exc.code, body=self._decode_body(raw_body))
+
+    @staticmethod
+    def _decode_body(raw: bytes) -> dict[str, Any]:
+        if not raw:
+            return {}
+        try:
+            decoded = json.loads(raw.decode("utf-8", errors="replace"))
+        except (ValueError, UnicodeDecodeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
+
+class QaWritebackClient:
+    """题库开放 API 回写客户端：令牌缓存 + 三步 POST + 单请求重试。
+
+    线程安全说明：当前仅被单个 worker 线程调用；令牌状态仍由
+    threading.Lock 保护（双重检查），为多 worker 升级预留。
+    """
+
+    def __init__(
+        self,
+        transport: HttpTransport,
+        base_url: str,
+        client_id: str,
+        client_secret: str,
+        timeout: int = WRITEBACK_TIMEOUT_SECONDS,
+    ) -> None:
+        self._transport = transport
+        self._base_url = (base_url or "").rstrip("/")
+        self._client_id = client_id or ""
+        self._client_secret = client_secret or ""
+        self._timeout = timeout
+        self._token: str = ""
+        self._token_deadline: float = 0.0
+        self._token_lock = threading.Lock()
+
+    def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """执行 ①提问 ②答复 ③归档 全链路，返回摘要（供日志）。
+
+        部分成功语义：三步不是事务。① 失败则整任务终止（抛
+        WritebackError）；②/③ 失败只记日志不重跑——重试只发生在单个
+        HTTP 请求层面，避免答复步骤产生重复追加行。
+        """
+        external_id = str(payload.get("external_id", ""))
+        request_body = {
+            "external_id": external_id,
+            "channel": "qq_bot",
+            "channel_subject": payload.get("qq", ""),
+            "qq": payload.get("qq", ""),
+            "question_text": payload.get("question_text", ""),
+            "question_images": list(payload.get("question_images") or []),
+            "meta": dict(payload.get("meta") or {}),
+        }
+        request_result = self._post_with_auth("/api/open/v1/qa/requests", request_body)
+        request_record = request_result.get("request") if isinstance(request_result.get("request"), dict) else None
+        qa_request_id = request_record.get("id") if isinstance(request_record, dict) else None
+        if qa_request_id is None:
+            raise WritebackError("qa/requests 响应缺少 request.id", status=None)
+        deduplicated = bool(request_result.get("deduplicated"))
+
+        answer_step_ok = False
+        try:
+            self._post_with_auth(
+                f"/api/open/v1/qa/requests/{qa_request_id}/answer",
+                {
+                    "answer_text": payload.get("answer_text") or "（模型未给出答案）",
+                    "analysis_text": payload.get("analysis_text", ""),
+                    "external_ref": (payload.get("meta") or {}).get("pdf_url", ""),
+                },
+            )
+            answer_step_ok = True
+        except WritebackError as exc:
+            logger.warning(
+                "%s 答复步骤失败（不影响归档步骤） external_id=%s status=%s err=%s",
+                WRITEBACK_LOG_PREFIX, external_id, exc.status, exc,
+            )
+
+        archive_step_ok = False
+        try:
+            self._post_with_auth(
+                "/api/open/v1/archive/entries",
+                {
+                    "qa_request_id": qa_request_id,
+                    "external_id": external_id,
+                    "draft": dict(payload.get("draft") or {}),
+                },
+            )
+            archive_step_ok = True
+        except WritebackError as exc:
+            logger.warning(
+                "%s 归档步骤失败 external_id=%s status=%s err=%s",
+                WRITEBACK_LOG_PREFIX, external_id, exc.status, exc,
+            )
+
+        return {
+            "qa_request_id": qa_request_id,
+            "deduplicated": deduplicated,
+            "answer_step_ok": answer_step_ok,
+            "archive_step_ok": archive_step_ok,
+        }
+
+    def _get_token(self, force_refresh: bool = False) -> str:
+        """取缓存令牌；过期（或强制刷新）时在锁内重新申请，双重检查避免重复刷新。"""
+        if not force_refresh and self._token and time.monotonic() < self._token_deadline:
+            return self._token
+        with self._token_lock:
+            if not force_refresh and self._token and time.monotonic() < self._token_deadline:
+                return self._token
+            token, expires_in = self._request_token()
+            self._token = token
+            self._token_deadline = time.monotonic() + max(float(expires_in), 0.0) - TOKEN_EXPIRY_MARGIN_SECONDS
+            logger.info("%s 令牌刷新成功（expires_in=%ss）", WRITEBACK_LOG_PREFIX, expires_in)
+            return self._token
+
+    def _request_token(self) -> tuple[str, float]:
+        """client_credentials 换取令牌；按重试矩阵处理瞬时故障，最终失败抛 WritebackError。"""
+        credentials = base64.b64encode(f"{self._client_id}:{self._client_secret}".encode("utf-8")).decode("ascii")
+        url = f"{self._base_url}/api/oauth/token"
+        headers = {"Authorization": f"Basic {credentials}"}
+        form = {"grant_type": "client_credentials"}
+        last_error: Optional[WritebackError] = None
+        for attempt in range(1, WRITEBACK_MAX_ATTEMPTS + 1):
+            try:
+                response = self._transport.post_form(url, form, headers, self._timeout)
+            except Exception as exc:  # 网络层异常：可重试
+                last_error = WritebackError(f"令牌请求网络错误: {exc}", status=None)
+            else:
+                if response.status in (200, 201):
+                    token = response.body.get("access_token")
+                    expires_in = response.body.get("expires_in")
+                    if isinstance(token, str) and token and expires_in is not None:
+                        try:
+                            return token, float(expires_in)
+                        except (TypeError, ValueError):
+                            last_error = WritebackError("令牌响应 expires_in 非法", status=response.status)
+                    else:
+                        # 响应体缺字段：重试无意义，永久失败
+                        raise WritebackError("令牌响应缺少 access_token/expires_in", status=response.status)
+                elif response.status in (429,) or 500 <= response.status < 600:
+                    last_error = WritebackError("令牌请求瞬时失败", status=response.status)
+                else:
+                    raise WritebackError("令牌请求被拒绝（凭据或权限问题）", status=response.status)
+            if attempt < WRITEBACK_MAX_ATTEMPTS:
+                time.sleep(self._retry_delay(attempt))
+        assert last_error is not None
+        raise last_error
+
+    def _post_with_auth(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        """带 Bearer 头的 POST；401 → 强制刷新令牌重发一次（仅一次）。"""
+        url = f"{self._base_url}{path}"
+        response = self._post_with_retry(url, {"Authorization": f"Bearer {self._get_token()}"}, body)
+        if response.status == 401:
+            logger.info("%s 业务请求收到 401，强制刷新令牌重发一次 path=%s", WRITEBACK_LOG_PREFIX, path)
+            response = self._post_with_retry(url, {"Authorization": f"Bearer {self._get_token(force_refresh=True)}"}, body)
+        if response.status in (200, 201):
+            return response.body
+        raise WritebackError(f"请求失败 path={path}", status=response.status)
+
+    def _post_with_retry(self, url: str, headers: dict[str, str], body: dict[str, Any]) -> HttpResponse:
+        """单请求重试矩阵：网络错/429/5xx 退避重发（≤3 次）；401 交给调用方续期；
+        其余 4xx 永久失败立即抛出。返回的 HttpResponse 由调用方判定成功与否。"""
+        last_error: Optional[WritebackError] = None
+        for attempt in range(1, WRITEBACK_MAX_ATTEMPTS + 1):
+            try:
+                response = self._transport.post_json(url, body, headers, self._timeout)
+            except Exception as exc:  # URLError / socket.timeout / ConnectionError 等：可重试
+                last_error = WritebackError(f"网络错误: {exc}", status=None)
+            else:
+                if response.status == 401:
+                    return response
+                if response.status in (429,) or 500 <= response.status < 600:
+                    last_error = WritebackError("服务端瞬时失败", status=response.status)
+                else:
+                    # 2xx 成功，或 400/403/404 等永久失败：都不重试
+                    return response
+            if attempt < WRITEBACK_MAX_ATTEMPTS:
+                time.sleep(self._retry_delay(attempt))
+        assert last_error is not None
+        raise last_error
+
+    @staticmethod
+    def _retry_delay(attempt: int) -> float:
+        """指数退避 + 抖动：约 1s、2s……"""
+        return WRITEBACK_RETRY_BASE_DELAY * 2 ** (attempt - 1) + random.uniform(0, 0.5)
+
+
+class WritebackScheduler:
+    """回写调度/队列层：有界队列 + 单 daemon worker 线程。
+
+    只依赖「一个可调用的 submit_fn(payload) -> dict」，不感知
+    HTTP/令牌/题库契约——那是 QaWritebackClient 的事。
+    submit_fn 为 None（未配置/开关关闭）时，enqueue 静默 no-op。
+    """
+
+    def __init__(self, submit_fn: Optional[Any] = None, maxsize: int = WRITEBACK_QUEUE_MAXSIZE) -> None:
+        self._submit_fn = submit_fn
+        self._queue: "queue.Queue[Optional[WritebackJob]]" = queue.Queue(maxsize=maxsize)
+        self._workers: list[threading.Thread] = []
+        self._started = False
+
+    @property
+    def enabled(self) -> bool:
+        return self._submit_fn is not None
+
+    def enqueue(self, payload: dict[str, Any]) -> bool:
+        """同步、非阻塞、永不抛错。入队成功返回 True；
+        队列满丢弃返回 False（已记 WARNING）；未启用返回 False。"""
+        if self._submit_fn is None:
+            return False
+        try:
+            external_id = str(payload.get("external_id", ""))
+            job = WritebackJob(external_id=external_id, payload=payload, enqueued_at=time.time())
+            self._queue.put_nowait(job)
+        except queue.Full:
+            logger.warning(
+                "%s 回写队列已满，丢弃本次任务 external_id=%s",
+                WRITEBACK_LOG_PREFIX, payload.get("external_id", ""),
+            )
+            return False
+        except Exception as exc:  # 兜底：生产端任何异常都不允许上抛
+            logger.warning("%s 入队异常（已忽略） err=%s", WRITEBACK_LOG_PREFIX, exc)
+            return False
+        logger.debug("%s 回写任务已入队 external_id=%s pending=%d", WRITEBACK_LOG_PREFIX, external_id, self._queue.qsize())
+        return True
+
+    def start(self) -> None:
+        """幂等启动 worker 线程；未启用时不做任何事。"""
+        if self._submit_fn is None or self._started:
+            return
+        self._started = True
+        worker = threading.Thread(target=self._worker_loop, name="qbk-writeback-worker", daemon=True)
+        worker.start()
+        self._workers.append(worker)
+
+    def stop(self) -> None:
+        """发送哨兵，worker 排空队列内剩余任务后退出；限时 join 5s，超时不等待。"""
+        if not self._started:
+            return
+        self._started = False
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:  # 理论上哨兵入队不会满（worker 在消费），兜底不阻塞
+            pass
+        for worker in self._workers:
+            if worker.is_alive():
+                worker.join(5)
+        self._workers.clear()
+
+    def pending_count(self) -> int:
+        """观测用：队列中待处理任务数。"""
+        return self._queue.qsize()
+
+    def _worker_loop(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is None:  # 哨兵：排空后退出
+                break
+            try:
+                summary = self._submit_fn(job.payload)
+                logger.info(
+                    "%s 回写成功 external_id=%s qa_request_id=%s deduplicated=%s",
+                    WRITEBACK_LOG_PREFIX,
+                    job.external_id,
+                    summary.get("qa_request_id") if isinstance(summary, dict) else None,
+                    summary.get("deduplicated") if isinstance(summary, dict) else None,
+                )
+            except Exception as exc:  # 兜底：任何异常只记日志，绝不上抛
+                logger.warning("%s 回写失败 external_id=%s err=%s", WRITEBACK_LOG_PREFIX, job.external_id, exc)
+
+
 @register("astrbot_plugin_xelatex_pdf", "CodeBuddy", "使用 XeLaTeX 生成 PDF 的 AstrBot 插件", PLUGIN_VERSION)
 class Plugin(Star):
     """将多模态问答结果渲染为 XeLaTeX PDF 的 AstrBot 插件。"""
@@ -209,6 +559,20 @@ class Plugin(Star):
         self.public_file_host = self._get_config_value("file_server_host", "XELATEX_FILE_SERVER_HOST", "")
         self._file_server: ThreadingHTTPServer | None = None
         self._file_server_thread: threading.Thread | None = None
+        # 答疑归档回写题库：读配置并做启用判定。四项任一缺失/开关关闭时
+        # 挂空转调度器（enqueue no-op），不产生启动错误——回写是旁路。
+        self.qbk_base_url = str(self._get_config_value("qbk_base_url", "XELATEX_QBK_BASE_URL", "http://172.17.0.1:3000") or "").rstrip("/")
+        self.qbk_client_id = str(self._get_config_value("qbk_client_id", "XELATEX_QBK_CLIENT_ID", "") or "")
+        self.qbk_client_secret = str(self._get_config_value("qbk_client_secret", "XELATEX_QBK_CLIENT_SECRET", "") or "")
+        self.archive_enabled = str(self._get_config_value("archive_enabled", "XELATEX_ARCHIVE_ENABLED", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
+        self.writeback_scheduler = WritebackScheduler(submit_fn=None)
+        if self.archive_enabled and self.qbk_base_url and self.qbk_client_id and self.qbk_client_secret:
+            writeback_client = QaWritebackClient(HttpTransport(), self.qbk_base_url, self.qbk_client_id, self.qbk_client_secret)
+            self.writeback_scheduler = WritebackScheduler(submit_fn=writeback_client.submit)
+            self.writeback_scheduler.start()
+            logger.info("%s 归档回写已启用 base_url=%s", WRITEBACK_LOG_PREFIX, self.qbk_base_url)
+        else:
+            logger.info("%s 归档回写未启用（开关关闭或凭据未配置）", WRITEBACK_LOG_PREFIX)
         self._start_file_server()
 
     async def initialize(self) -> None:
@@ -219,7 +583,11 @@ class Plugin(Star):
         return None
 
     async def terminate(self) -> None:
-        """插件卸载时关闭内置文件服务。"""
+        """插件卸载时停止回写调度器并关闭内置文件服务。"""
+        scheduler = getattr(self, "writeback_scheduler", None)
+        if scheduler is not None:
+            # 哨兵排空 + 限时 join；worker 是 daemon 线程，超时不阻塞卸载
+            await asyncio.to_thread(scheduler.stop)
         server = self._file_server
         self._file_server = None
         self.initialized = False
@@ -360,6 +728,23 @@ class Plugin(Star):
             self.append_history(session_id, question_text, structured["body"])
             if response.file_payload and response.file_payload.get("path"):
                 self.last_pdf_by_session[session_id] = Path(response.file_payload["path"])
+            # 归档回写（旁路链路）：组 payload → 入队。失败隔离铁律：
+            # 这里任何异常都不允许改变 return response 的值。
+            try:
+                if structured["archive"]["present"]:
+                    writeback_payload = self._build_writeback_payload(
+                        event=event,
+                        question_text=question_text,
+                        structured=structured,
+                        parsed_message=parsed_message,
+                        session_id=session_id,
+                        base_name=base_name,
+                        used_model=used_model,
+                        response=response,
+                    )
+                    self._enqueue_qa_writeback(writeback_payload)
+            except Exception as exc:
+                logger.warning("%s 回写组装/入队失败（已忽略） err=%s", WRITEBACK_LOG_PREFIX, exc)
 
         return response
 
@@ -737,6 +1122,18 @@ class Plugin(Star):
                     "也可以用 Markdown 标题写“## 定义”“#### 例 1”“#### 注”等，外部程序会自动转换为 ElegantBook 环境。"
                     "数学要求：行内公式优先使用 \\(...\\) 或 $...$；行间公式使用 \\[...\\] 或 $$...$$；可使用 amsmath/amsfonts/amssymb 常见命令，如 \\mathbb、\\varepsilon、\\delta、\\Rightarrow。"
                     "内容要求：直接回答用户问题，不要寒暄，不要说“下面是”。标题与提要必须根据本次回答的实际内容撰写，不要写空话套话。"
+                    "归档要求（供程序自动读取）：如果你判断本次回答完整解答了一道可收录的题目（题干条件充分、解答完整），"
+                    "请在正文最后空一行，输出如下归档块，块内每行一个标记、顺序固定："
+                    "[ARCHIVE]"
+                    "[STEM] 规范题干：把用户口语化提问或图片转述整理为正式题目表述，保留全部已知条件与数学符号（行内公式用 $...$），"
+                    "不遗漏条件，不混入解答内容；选择题须把选项完整写入（A. … B. …）"
+                    "[ANSWER] 最终答案：一行给出（选择题写选项字母，填空题写结果，证明/论述题写“见解析”）"
+                    "[TYPE] 题型：single（单选）/ multiple（多选）/ blank（填空）/ proof（证明）/ calc（计算）/ answer（解答）六选一"
+                    "[DIFFICULTY] 难度：1-5 的整数（1 最易）"
+                    "[TAGS] 知识点：至多 5 个标签，用英文逗号分隔，例如 极限,洛必达法则,中值定理"
+                    "[/ARCHIVE]"
+                    "若本次内容不是完整题目（闲聊、工具命令、绘图请求、条件不全、追问讨论），不要输出归档块。"
+                    "归档块会被程序剥离、不排版进 PDF；标记格式必须严格一致。"
                     "禁止输出：\\documentclass、\\begin{document}、\\end{document}、\\usepackage、\\author、\\date、\\maketitle、页眉页脚设置、模型名、回答时间、作者信息。"
                     "不要把模型名或回答时间放在正文开头；这些元信息由外部模板写入页脚。"
                 ),
@@ -1006,30 +1403,101 @@ class Plugin(Star):
                     parts.append("图片附件（OCR 未取到结果）：" + "，".join(names))
         return "\n\n".join(parts)
 
-    def _parse_structured_answer(self, answer_text: str) -> dict[str, str]:
-        """解析 LLM 返回的 [TITLE]/[SUMMARY] 结构化标记。
+    def _parse_structured_answer(self, answer_text: str) -> dict[str, Any]:
+        """解析 LLM 返回的 [TITLE]/[SUMMARY] 结构化标记与 [ARCHIVE] 归档围栏块。
 
-        返回 {"title", "summary", "body"}。标记缺失或解析失败时对应字段为空，
-        由调用方决定降级策略（标题回退问题截取、提要盒省略），不伪造内容。
+        返回 {"title", "summary", "body", "archive"} 完整四键。契约：
+        任何解析异常都不向调用方抛出——标记缺失或解析失败时对应字段回落
+        默认值，由调用方决定降级策略，不伪造内容。归档块在 body 中整体
+        剥离（围栏外的 [ANSWER] 等字样一律不解析），保证 PDF 零污染。
         """
         title = ""
         summary = ""
-        body_lines: list[str] = []
-        for line in (answer_text or "").splitlines():
-            stripped = line.strip()
-            if not title and stripped.startswith("[TITLE]"):
-                title = stripped.removeprefix("[TITLE]").strip()
-                continue
-            if not summary and stripped.startswith("[SUMMARY]"):
-                summary = stripped.removeprefix("[SUMMARY]").strip()
-                continue
-            body_lines.append(line)
-        body = "\n".join(body_lines).strip()
+        archive = self._empty_archive_dict()
+        try:
+            body_lines: list[str] = []
+            archive_lines: list[str] = []
+            inside_archive = False
+            archive_opened = False
+            for line in (answer_text or "").splitlines():
+                stripped = line.strip()
+                if not inside_archive and stripped == "[ARCHIVE]":
+                    inside_archive = True
+                    archive_opened = True
+                    continue
+                if inside_archive and stripped == "[/ARCHIVE]":
+                    inside_archive = False
+                    continue
+                if inside_archive:
+                    archive_lines.append(stripped)
+                    continue
+                if not title and stripped.startswith("[TITLE]"):
+                    title = stripped.removeprefix("[TITLE]").strip()
+                    continue
+                if not summary and stripped.startswith("[SUMMARY]"):
+                    summary = stripped.removeprefix("[SUMMARY]").strip()
+                    continue
+                body_lines.append(line)
+            if archive_opened:
+                archive = self._parse_archive_block(archive_lines)
+            body = "\n".join(body_lines).strip()
+            # 既有降级：无标记无正文时 body 回落原文；但检测到归档块时不得回落，
+            # 否则会把 [ARCHIVE] 标记重新带回正文、污染 PDF
+            if not archive_opened:
+                body = body or (answer_text or "").strip()
+        except Exception as exc:  # 契约兜底：解析层永不上抛
+            logger.warning("%s 结构化解析异常（已回落默认值） err=%s", WRITEBACK_LOG_PREFIX, exc)
+            return {
+                "title": "",
+                "summary": "",
+                "body": (answer_text or "").strip(),
+                "archive": self._empty_archive_dict(),
+            }
         return {
             "title": title,
             "summary": summary,
-            "body": body or (answer_text or "").strip(),
+            "body": body,
+            "archive": archive,
         }
+
+    @staticmethod
+    def _empty_archive_dict() -> dict[str, Any]:
+        """未检测到归档块时的缺省结构；present=False 时调用方跳过整个回写。"""
+        return {
+            "present": False,
+            "stem": "",
+            "answer": "",
+            "type": "answer",
+            "difficulty": 3,
+            "tags": [],
+        }
+
+    def _parse_archive_block(self, lines: list[str]) -> dict[str, Any]:
+        """逐行容错解析归档块内容：单行坏只丢该字段并回落默认，不整体作废。"""
+        archive = self._empty_archive_dict()
+        archive["present"] = True
+        for line in lines:
+            if line.startswith("[STEM]"):
+                archive["stem"] = line.removeprefix("[STEM]").strip()
+            elif line.startswith("[ANSWER]"):
+                archive["answer"] = line.removeprefix("[ANSWER]").strip()
+            elif line.startswith("[TYPE]"):
+                value = line.removeprefix("[TYPE]").strip().lower()
+                archive["type"] = value if value in ARCHIVE_TYPE_WHITELIST else "answer"
+            elif line.startswith("[DIFFICULTY]"):
+                value = line.removeprefix("[DIFFICULTY]").strip()
+                if value.isdigit() and 1 <= int(value) <= 5:
+                    archive["difficulty"] = int(value)
+                else:
+                    archive["difficulty"] = 3
+            elif line.startswith("[TAGS]"):
+                tags: list[str] = []
+                for tag in line.removeprefix("[TAGS]").split(","):
+                    tag = tag.strip()
+                    if tag and tag not in tags:
+                        tags.append(tag)
+                archive["tags"] = tags[:ARCHIVE_TAG_LIMIT]
+        return archive
 
     def build_tex_source(self, parsed_message: ParsedMessage, body_override: Optional[str] = None, question_text: str = "", title_override: Optional[str] = None, summary_override: Optional[str] = None) -> str:
         if body_override is None:
@@ -2112,6 +2580,110 @@ class Plugin(Star):
                     return str(value)
         return ""
 
+    def _extract_message_id(self, event: Any) -> str:
+        """从事件中提取消息 id（duck-typing 多属性探测，仿 _extract_qq_number）。
+
+        AstrBot 各适配器的属性名不统一，逐一探测；取不到返回空串，
+        由 _build_external_id 回落时间戳+哈希方案。
+        """
+        if event is None:
+            return ""
+        for source in (event, getattr(event, "message_obj", None)):
+            if source is None:
+                continue
+            for attr in ("message_id", "msg_id", "id"):
+                value = getattr(source, attr, None)
+                if value:
+                    return str(value)
+        return ""
+
+    def _build_external_id(self, event: Any, question_text: str) -> str:
+        """构建回写幂等键：优先 qq:<消息id>（重发天然去重），
+        取不到时回落 ts:<秒级时间戳>:<题干 sha256 前 16 位>。"""
+        message_id = self._extract_message_id(event)
+        if message_id:
+            return f"qq:{message_id}"
+        digest = hashlib.sha256((question_text or "").encode("utf-8")).hexdigest()[:16]
+        return f"ts:{time.strftime('%Y%m%d%H%M%S')}:{digest}"
+
+    def _build_archive_draft(self, structured: dict[str, Any], question_text: str, image_urls: list[str]) -> dict[str, Any]:
+        """组装归档 draft（API 白名单字段）：stem 缺失回落原始提问，
+        answer 缺失回落 [SUMMARY]，其余字段直接取解析结果。"""
+        archive = structured.get("archive") if isinstance(structured.get("archive"), dict) else self._empty_archive_dict()
+        summary = str(structured.get("summary", "") or "")
+        analysis_text = str(structured.get("body", "") or "")
+        answer_text = str(archive.get("answer", "") or "") or summary or "（模型未给出答案）"
+        return {
+            "stem": str(archive.get("stem", "") or "") or (question_text or "").strip(),
+            "answer": answer_text,
+            "analysis": analysis_text,
+            "type": str(archive.get("type", "") or "answer"),
+            "difficulty": int(archive.get("difficulty", 3) or 3),
+            "images": list(image_urls or []),
+            "tags": list(archive.get("tags") or []),
+        }
+
+    def _build_question_image_urls(self, parsed_message: ParsedMessage) -> list[str]:
+        """题目图片公网 URL：仅取已本地化（落在受管目录内）的图片，
+        经文件服务 asset 路由对外暴露；远程直链与不可达文件一律跳过。"""
+        urls: list[str] = []
+        for image in parsed_message.images:
+            local_path = (image.path or "").replace("file://", "")
+            if not local_path:
+                continue
+            try:
+                if not self._is_managed_path(Path(local_path)):
+                    continue
+            except Exception:
+                continue
+            urls.append(self._public_file_url(Path(local_path)))
+        return urls
+
+    def _build_writeback_payload(
+        self,
+        event: Any,
+        question_text: str,
+        structured: dict[str, Any],
+        parsed_message: ParsedMessage,
+        session_id: str,
+        base_name: str,
+        used_model: str,
+        response: CommandResponse,
+    ) -> dict[str, Any]:
+        """组装回写 payload：入队时刻冻结全部字段，worker 消费时不再依赖外部状态。"""
+        image_urls = self._build_question_image_urls(parsed_message)
+        summary = str(structured.get("summary", "") or "")
+        archive = structured.get("archive") if isinstance(structured.get("archive"), dict) else self._empty_archive_dict()
+        answer_text = str(archive.get("answer", "") or "") or summary or "（模型未给出答案）"
+        analysis_text = str(structured.get("body", "") or "")
+        pdf_url = ""
+        if response.file_payload and response.file_payload.get("url"):
+            pdf_url = str(response.file_payload["url"])
+        return {
+            "external_id": self._build_external_id(event, question_text),
+            "question_text": question_text,
+            "question_images": image_urls,
+            "qq": self._extract_qq_number(event),
+            "meta": {
+                "model": used_model,
+                "base_name": base_name,
+                "pdf_url": pdf_url,
+                "session_id": session_id,
+            },
+            "answer_text": answer_text,
+            "analysis_text": analysis_text,
+            "draft": self._build_archive_draft(structured, question_text, image_urls),
+        }
+
+    def _enqueue_qa_writeback(self, payload: dict[str, Any]) -> None:
+        """回写入队钩子：内部全兜底，任何异常都不允许上抛到调用方。"""
+        try:
+            scheduler = getattr(self, "writeback_scheduler", None)
+            if scheduler is not None:
+                scheduler.enqueue(payload)
+        except Exception as exc:
+            logger.warning("%s 入队钩子异常（已忽略） err=%s", WRITEBACK_LOG_PREFIX, exc)
+
     def _extract_question_keyword(self, question_text: str) -> str:
         """从题目文本中提取简洁关键词，作为文件命名的可识别标识。"""
         normalized = re.sub(r"\s+", "", question_text or "")
@@ -2157,7 +2729,7 @@ class Plugin(Star):
         except OSError:
             parent = exported_path.parent
         prefix = "pdf"
-        for category_prefix, category_dir in (("source", self.source_dir), ("log", self.log_dir)):
+        for category_prefix, category_dir in (("source", self.source_dir), ("log", self.log_dir), ("asset", self.asset_dir)):
             if category_dir is None:
                 continue
             try:
@@ -2183,11 +2755,12 @@ class Plugin(Star):
         self._file_server_thread.start()
 
     def _build_file_handler(self):
-        # 按分类目录路由：/pdf/ → pdfs/，/source/ → sources/，/log/ → logs/
+        # 按分类目录路由：/pdf/ → pdfs/，/source/ → sources/，/log/ → logs/，/asset/ → assets/
         category_dirs = {
             "pdf": self.pdf_dir,
             "source": self.source_dir,
             "log": self.log_dir,
+            "asset": self.asset_dir,
         }
 
         class QuietHandler(SimpleHTTPRequestHandler):

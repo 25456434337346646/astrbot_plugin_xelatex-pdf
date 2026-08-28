@@ -60,5 +60,30 @@
         "type": "int",
         "hint": "内置文件服务监听端口，默认 8765",
         "default": 8765
+    },
+    "qbk_base_url": {
+        "description": "题库开放 API 基址",
+        "type": "string",
+        "hint": "答疑归档回写的题库服务地址，例如 http://172.17.0.1:3000（docker0 网关；勿用 172.19.0.1，compose 网络重建会漂移）",
+        "default": "http://172.17.0.1:3000"
+    },
+    "qbk_client_id": {
+        "description": "题库开放 API client_id",
+        "type": "string",
+        "hint": "OAuth client_credentials 凭据的 client_id；留空则不启用归档回写",
+        "default": ""
+    },
+    "qbk_client_secret": {
+        "description": "题库开放 API client_secret",
+        "type": "string",
+        "hint": "OAuth client_credentials 凭据的 secret；生产建议凭据文件挂载 + 环境变量注入，不写明文配置",
+        "obvious_hint": true,
+        "default": ""
+    },
+    "archive_enabled": {
+        "description": "答疑归档回写开关",
+        "type": "bool",
+        "hint": "灰度总开关，默认关闭；编译成功后才会触发回写，回写失败不影响答疑",
+        "default": false
     }
 }
