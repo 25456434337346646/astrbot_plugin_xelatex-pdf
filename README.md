@@ -1,8 +1,40 @@
 # astrbot_plugin_xelatex_pdf
 
+[![CI](https://github.com/25456434337346646/astrbot_plugin_xelatex-pdf/actions/workflows/ci.yml/badge.svg)](https://github.com/25456434337346646/astrbot_plugin_xelatex-pdf/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-5B8DEF.svg)](https://github.com/AstrBotDevs/AstrBot)
+
 AstrBot 的多模态问答 PDF 插件。它接收文本、引用消息、图片或 PDF，调用
 OpenAI 兼容的文本/视觉模型生成结构化答案，再通过 XeLaTeX 和 ElegantBook
 渲染为中文 PDF。
+
+## Overview (English)
+
+An AstrBot plugin that turns a chat question into a typeset Chinese PDF. It accepts
+text, quoted replies, images and PDF attachments, runs vision OCR and structure
+extraction, then renders the answer with XeLaTeX and the bundled ElegantBook class,
+posting the PDF back through the message adapter.
+
+- Pipeline: `image / PDF / quoted reply -> vision OCR -> structured answer -> XeLaTeX -> PDF`
+- Multi-question batches ("solve 8 and 10") are split and rendered in parallel, one PDF each
+- CJK-safe rendering: xeCJK, embedded fonts and a book class — the exact combination where
+  HTML-to-PDF pipelines and reportlab both break
+- Text and vision models each support fallback chains; answers can optionally be written back
+  to a question-bank API (`archive_enabled`, off by default)
+- No third-party Python dependencies at runtime: `xelatex` compiles, PyMuPDF or `pdftoppm`
+  renders pages, Pillow is used only when the host image provides it
+- CI: `ruff` + `unittest` on Python 3.10 / 3.11 / 3.12 (`.github/workflows/ci.yml`)
+- Design notes for the writeback subsystem: [`docs/qa-archive-research.md`](docs/qa-archive-research.md)
+  and [`docs/qa-archive-implementation-design.md`](docs/qa-archive-implementation-design.md)
+
+Install from the AstrBot plugin page using this repository URL:
+
+```text
+https://github.com/25456434337346646/astrbot_plugin_xelatex-pdf
+```
+
+The sections below are in Chinese and cover the full option table, command reference and the
+required TeX Live packages.
 
 ## 功能
 
@@ -116,3 +148,11 @@ ruff check main.py tests
 python -m compileall -q main.py tests
 python -m unittest discover -s tests -v
 ```
+
+## 许可证
+
+本插件自身代码以 MIT 许可证发布，全文见 [LICENSE](LICENSE)。
+
+仓库内的 `astrbot-elegantbook.cls` 派生自 ElegantBook 4.3，按 LPPL 1.3c
+发布；来源、修改说明与许可证全文见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+和 [`licenses/LPPL-1.3c.txt`](licenses/LPPL-1.3c.txt)。
