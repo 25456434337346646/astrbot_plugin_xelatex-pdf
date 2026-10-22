@@ -1,7 +1,17 @@
 name: astrbot_plugin_xelatex_pdf
 display_name: XeLaTeX PDF
-short_desc: 将多模态问答结果渲染为结构化中文 PDF。
-description: 处理文本、引用消息、图片和 PDF，经文本与视觉模型生成结构化答案，再使用 XeLaTeX 渲染并回传 PDF。
+short_desc: 把多模态问答结果渲染成排版精美的中文 PDF。
+desc: 接收文本、引用消息、图片或 PDF，调用 OpenAI 兼容的文本/视觉模型生成结构化答案，再通过 XeLaTeX（ElegantBook 模板）渲染成中文 PDF 回传。支持多题并行作答、图片自动转正、备用模型自动降级与会话记忆，适合讲题、答疑、学习笔记等场景。
 version: 0.7.0
-author: CodeBuddy
+author: 25456434337346646
+repo: https://github.com/25456434337346646/astrbot_plugin_xelatex-pdf
 astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+tags:
+  - latex
+  - pdf
+  - 多模态
+  - 数学
+  - 教育
