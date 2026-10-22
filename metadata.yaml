@@ -2,6 +2,6 @@ name: astrbot_plugin_xelatex_pdf
 display_name: XeLaTeX PDF
 short_desc: 将多模态问答结果渲染为结构化中文 PDF。
 description: 处理文本、引用消息、图片和 PDF，经文本与视觉模型生成结构化答案，再使用 XeLaTeX 渲染并回传 PDF。
-version: 0.5.0
+version: 0.7.0
 author: CodeBuddy
 astrbot_version: ">=4.16,<5"

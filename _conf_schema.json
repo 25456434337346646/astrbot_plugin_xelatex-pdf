@@ -49,6 +49,58 @@
         "hint": "当主视觉模型 (OCR) 超时或失败时，依次尝试这些模型。例如: gpt-4o,qwen-vl-plus",
         "default": ""
     },
+    "orientation_correction_enabled": {
+        "description": "图片自动转正",
+        "type": "bool",
+        "hint": "OCR 与 PDF 插图前把侧转/倒置的照片转正（EXIF 方向 + 视觉模型判定）。每张图多 1-2 次小的视觉调用、约 3-7 秒；关闭后侧着拍的题可能被读错",
+        "default": true
+    },
+    "multi_question_enabled": {
+        "description": "多题并行作答",
+        "type": "bool",
+        "hint": "指令里点了多个题号（如「解决第8、10题」）且带题图/引用时，按题拆开并行作答，每题一份 PDF；指令含「一起/合并/对比/比较」时不拆。每条指令能拆几题由下面的回复次数决定",
+        "default": true
+    },
+    "reply_limit_group": {
+        "description": "群聊每条指令最多回复几次",
+        "type": "int",
+        "hint": "多题模式每题一份 PDF 占一次；缺题或题数超额时另占一次发说明。QQ 官方机器人群聊同一条消息最多被动回复 5 次（5 分钟内），调高会发送失败。范围 2-20",
+        "default": 5,
+        "condition": {
+            "multi_question_enabled": true
+        }
+    },
+    "reply_limit_private": {
+        "description": "单聊每条指令最多回复几次",
+        "type": "int",
+        "hint": "QQ 官方机器人单聊同一条消息最多被动回复 4 次（60 分钟内），调高会发送失败。范围 2-20",
+        "default": 4,
+        "condition": {
+            "multi_question_enabled": true
+        }
+    },
+    "reply_limit_other": {
+        "description": "其他平台每条指令最多回复几次",
+        "type": "int",
+        "hint": "非 QQ 官方机器人平台（如 NapCat/aiocqhttp）一条指令最多拆几份回复。范围 2-20",
+        "default": 5,
+        "condition": {
+            "multi_question_enabled": true
+        }
+    },
+    "file_retention_days": {
+        "description": "产物保留天数",
+        "type": "int",
+        "hint": "删除超过该天数的附件、PDF、LaTeX 源码与编译日志，0 表示不清理。保存后立即按新天数清理一轮，删除不可恢复。提交给题库的题图永久保留",
+        "default": 7,
+        "obvious_hint": true
+    },
+    "cleanup_interval_hours": {
+        "description": "清理间隔（小时）",
+        "type": "int",
+        "hint": "每隔多少小时清理一轮；插件启动和面板保存后也会立即清理一轮。范围 1-168",
+        "default": 6
+    },
     "file_server_host": {
         "description": "文件服务对外地址",
         "type": "string",
@@ -60,5 +112,30 @@
         "type": "int",
         "hint": "内置文件服务监听端口，默认 8765",
         "default": 8765
+    },
+    "qbk_base_url": {
+        "description": "题库开放 API 基址",
+        "type": "string",
+        "hint": "答疑归档回写的题库服务地址，例如 http://172.17.0.1:3000（docker0 网关；勿用 172.19.0.1，compose 网络重建会漂移）",
+        "default": "http://172.17.0.1:3000"
+    },
+    "qbk_client_id": {
+        "description": "题库开放 API client_id",
+        "type": "string",
+        "hint": "OAuth client_credentials 凭据的 client_id；留空则不启用归档回写",
+        "default": ""
+    },
+    "qbk_client_secret": {
+        "description": "题库开放 API client_secret",
+        "type": "string",
+        "hint": "OAuth client_credentials 凭据的 secret；生产建议凭据文件挂载 + 环境变量注入，不写明文配置",
+        "obvious_hint": true,
+        "default": ""
+    },
+    "archive_enabled": {
+        "description": "答疑归档回写开关",
+        "type": "bool",
+        "hint": "灰度总开关，默认关闭；编译成功后才会触发回写，回写失败不影响答疑",
+        "default": false
     }
 }

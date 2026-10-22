@@ -1,3 +1,5 @@
 # No required third-party Python packages.
 # PDF page rendering uses PyMuPDF when AstrBot provides it, then falls back to
 # the pdftoppm executable from poppler-utils.
+# Image orientation correction uses Pillow when AstrBot provides it and is
+# skipped otherwise.

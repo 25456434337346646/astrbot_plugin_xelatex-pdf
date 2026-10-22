@@ -11,7 +11,7 @@
 %%%%%%%%%%%%%%%%%%%%%
 % % !Mode:: "TeX:UTF-8"
 \NeedsTeXFormat{LaTeX2e}
-\ProvidesClass{astrbot-elegantbook}[2026/07/19 v0.5.0 AstrBot derivative of ElegantBook v4.3]
+\ProvidesClass{astrbot-elegantbook}[2026/07/19 v0.7.0 AstrBot derivative of ElegantBook v4.3]
 
 
 %%%

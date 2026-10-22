@@ -8,6 +8,9 @@ OpenAI 兼容的文本/视觉模型生成结构化答案，再通过 XeLaTeX 和
 
 - `/ai`、`/ask`、`/解答`、`/解析` 多个命令入口
 - 解析普通附件及 QQ Reply 中的文本、图片和 PDF
+- 图片在 OCR 与插图前自动转正（EXIF 方向 + 视觉模型判定侧转/倒置）
+- 多题并行：「解决第8、10题」这类指令按题拆开并行作答，每题一份 PDF（群聊最多 5 题、单聊 4 题）
+- 定期清理超过保留天数的附件、PDF、源码与日志；提交给题库的题图永久保留
 - PDF 转图片后交给视觉模型，失败时回退到本地文本提取/OCR
 - 文本模型和视觉模型均支持备用模型自动降级
 - 文档标题与内容提要由模型结构化返回（`[TITLE]`/`[SUMMARY]` 标记），非硬编码
@@ -41,6 +44,13 @@ OpenAI 兼容的文本/视觉模型生成结构化答案，再通过 XeLaTeX 和
 | `fallback_vision_models` | 否 | 空 | 逗号分隔的备用视觉模型 |
 | `file_server_host` | 否 | 空（自动用容器主机名） | 下载链接使用的 host；容器内插件+宿主机机器人时填 `127.0.0.1` 并映射端口 |
 | `file_server_port` | 否 | `8765` | 内置文件服务端口 |
+| `orientation_correction_enabled` | 否 | `true` | OCR 与插图前自动转正侧转/倒置的照片 |
+| `multi_question_enabled` | 否 | `true` | 指令里点了多个题号时按题拆开并行作答 |
+| `reply_limit_group` / `reply_limit_private` / `reply_limit_other` | 否 | `5` / `4` / `5` | 每条指令最多回复几次（QQ 官方机器人群聊/单聊/其他平台），决定一次最多拆几题；范围 2-20 |
+| `file_retention_days` | 否 | `7` | 附件/PDF/源码/日志保留天数，`0` 表示不清理 |
+| `cleanup_interval_hours` | 否 | `6` | 清理间隔（小时），范围 1-168 |
+
+以上各项都在 AstrBot WebUI 的插件配置页修改，保存后插件热重载立即生效（保留天数改小后会马上按新天数清理一轮）。
 
 密钥只应保存在 AstrBot 插件配置或环境变量中，不要提交到仓库。
 
@@ -52,6 +62,7 @@ OpenAI 兼容的文本/视觉模型生成结构化答案，再通过 XeLaTeX 和
 - 中文字体
 - PDF 输入建议安装 PyMuPDF，或提供 `pdftoppm`/`pdftotext`
 - 本地 OCR 回退需要 `tesseract` 及相应语言包
+- 图片方向自动转正需要 Pillow（AstrBot 镜像自带；缺失时跳过该步骤）
 
 Debian/Ubuntu 可按需安装（ElegantBook 派生类还需要 `tex-gyre`/`fonts-texgyre` 字体、`extarrows`、`bbding`、`adforn`、`biblatex` 等，已含在下表）：
 

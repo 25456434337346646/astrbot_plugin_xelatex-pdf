@@ -36,6 +36,7 @@ def bare_plugin() -> Plugin:
     plugin.last_tex_source_by_session = {}
     plugin.last_pdf_by_session = {}
     plugin.last_base_name_by_session = {}
+    plugin.pending_model_by_session = {}
     plugin.file_server_port = 8765
     return plugin
 
@@ -109,8 +110,12 @@ class MessageParsingTests(unittest.IsolatedAsyncioTestCase):
             response = await plugin.handle_event("ignored")
 
         self.assertTrue(response.success)
-        self.assertEqual(response.message, "已切换模型：another-model")
-        self.assertEqual(plugin.active_model_name, "another-model")
+        self.assertEqual(
+            response.message,
+            "已为下一题指定模型：another-model（仅本会话下一题生效，不影响全局）",
+        )
+        self.assertEqual(plugin.active_model_name, "text-model")
+        self.assertEqual(list(plugin.pending_model_by_session.values()), ["another-model"])
         localize.assert_not_called()
         generate.assert_not_called()
 

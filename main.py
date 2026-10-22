@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from contextlib import aclosing
 from dataclasses import dataclass, field
 import asyncio
 import base64
 import hashlib
+import io
 import json
+import logging
 import os
+import queue
+import random
 import re
 import socket
 import shutil
@@ -21,15 +26,107 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-PLUGIN_VERSION = "0.5.0"
+PLUGIN_VERSION = "0.7.0"
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_OCR_IMAGE_BYTES = 15 * 1024 * 1024
 MAX_OCR_PAGES = 12
 NETWORK_TIMEOUT_SECONDS = 30
 MODEL_TIMEOUT_SECONDS = 120
 VISION_TIMEOUT_SECONDS = 300
+# 图片方向判定只回答一个编号，超时要远短于 OCR，避免上游卡住拖慢整次问答
+ORIENTATION_TIMEOUT_SECONDS = 60
+# 一条消息内所有图片的方向判定共用这一个时间预算，上游失败一次即停止后续判定
+ORIENTATION_BUDGET_SECONDS = 90
+ORIENTATION_THUMBNAIL_SIZE = 768
+# 超过该像素数不在进程内解码（小体积的纯色大图也可能解出 GB 级内存）
+ORIENTATION_MAX_PIXELS = 40_000_000
+# 长截图缩到 768 后字小到读不清，模型只能瞎猜，宽高比超过它就不做模型判定
+ORIENTATION_MAX_ASPECT = 2.5
+# 实测「问文字顶部朝哪边」在 7 个样本里只对 2 个；「四个旋转版本里挑正的那张」8/8 全对
+ORIENTATION_PROMPT = (
+    "下面 4 张图是同一张图片的 4 种旋转版本，依次编号 1、2、3、4。"
+    "请找出其中文字方向正常（文字正立、可从左到右横向阅读）的那一张。只输出编号数字。"
+)
 PROCESS_TIMEOUT_SECONDS = 120
 STALE_WORKDIR_MAX_AGE_SECONDS = 24 * 60 * 60
+# 多题并行：一条指令最多拆几题由平台被动回复次数决定（每题一份 PDF 占一次回复）。
+# QQ 官方机器人：群聊同一条消息最多被动回复 5 次（5 分钟内），单聊 4 次（60 分钟内）
+QQ_OFFICIAL_GROUP_REPLY_SLOTS = 5
+QQ_OFFICIAL_C2C_REPLY_SLOTS = 4
+DEFAULT_REPLY_SLOTS = 5
+MULTI_QUESTION_RANGE_LIMIT = 20
+# 指令里出现这些词说明用户要的是把几题放在一起讲，不拆分
+MULTI_QUESTION_OPT_OUT_WORDS = ("一起", "合并", "一份", "综合", "对比", "比较", "联系", "关系", "区别", "异同")
+# 「利用第8题的结论解决第10题」里的第8题是引用，不是要作答的题
+MULTI_QUESTION_REFERENCE_PREFIXES = ("利用", "根据", "参考", "参照", "结合", "借助", "由", "用", "按")
+_QUESTION_TOKEN = r"(?:\d{1,3}|[一二三四五六七八九十两]{1,3})"
+_QUESTION_RANGE_SEPARATORS = "-–~～—至到"
+# 题号组：第8、10题 / 8-11题 / 第八到十题。数字前不能紧跟数字或小数点（「2.1题」不是第 1 题）
+QUESTION_GROUP_PATTERN = re.compile(
+    r"(第?)(?<![\d.．])(" + _QUESTION_TOKEN
+    + r"(?:\s*(?:[、,，]|和|及|与|跟|[-–~～—至到])\s*第?" + _QUESTION_TOKEN + r")*)\s*道?题"
+)
+QUESTION_GROUP_SEPARATOR = re.compile(r"\s*([、,，]|和|及|与|跟|[-–~～—至到])\s*")
+QUESTION_SPLIT_PROMPT = (
+    "你是题目定位助手，只负责从题目图片的识别文本里找出指定题号的题目，不做解答。"
+    "对每个要找的题号，先单独一行写 [Q 题号]，下一行起原样抄录该题完整题干："
+    "保留原文措辞、数学公式（LaTeX）、小问 (1)(2) 与选项；"
+    "若几道题共用前面的条件（如「设……，回答下列问题」），把共用条件一并抄进每道相关的题。"
+    "文本里找不到的题号，统一写在最后一行：[MISSING] 题号, 题号。"
+    "不要输出其他任何内容，不要编造题干。"
+)
+QUESTION_SPLIT_MARKER = re.compile(r"^[ \t]*\[Q\s*第?\s*(\d{1,3})\s*题?\][ \t]*", re.MULTILINE)
+QUESTION_SPLIT_MISSING_LINE = re.compile(r"^[ \t]*\[MISSING\].*$", re.MULTILINE)
+# 文本模型遇到限流/过载时的退避重试：并行作答会成倍放大上游 429，
+# 不退避就会直接降级到备用模型。退避时间所有并发请求共享
+THROTTLED_STATUS_CODES = frozenset({429, 502, 503, 504, 529})
+TEXT_MODEL_THROTTLE_RETRIES = 2
+TEXT_MODEL_MAX_BACKOFF_SECONDS = 20
+# 定期清理：插件产物按保留天数删除；被题库引用（热链）的题图永不删除
+CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
+PROTECTED_ASSETS_FILENAME = "qbk_referenced_assets.json"
+# 答疑归档回写题库（旁路链路）相关常量
+WRITEBACK_QUEUE_MAXSIZE = 64
+WRITEBACK_TIMEOUT_SECONDS = 15
+WRITEBACK_MAX_ATTEMPTS = 3
+WRITEBACK_RETRY_BASE_DELAY = 1.0
+TOKEN_EXPIRY_MARGIN_SECONDS = 60
+ARCHIVE_TYPE_WHITELIST = {"single", "multiple", "blank", "proof", "calc", "answer"}
+ARCHIVE_TAG_LIMIT = 20
+WRITEBACK_LOG_PREFIX = "[qbk]"
+
+# 数学片段识别：行间 \[...\] / $$...$$ 与行内 \(...\) / $...$。
+# `_tex_inline` 用它暂存公式以免被文本转义破坏；编译失败净化器用它定位
+# 需要补 \% 的数学区间（数学模式里裸 % 是注释符，会吞掉闭合定界符）。
+MATH_SPAN_PATTERN = re.compile(
+    r"\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|\$\$[\s\S]*?\$\$|\$[^$\n]+\$"
+)
+
+logger = logging.getLogger("astrbot_plugin_xelatex_pdf")
+
+# 文本模型退避时间点（time.monotonic）：并发作答线程共享，一个请求被限流，所有请求一起等
+_TEXT_MODEL_COOLDOWN_LOCK = threading.Lock()
+_text_model_cool_until = 0.0
+# 题库引用清单的读改写锁（回写入队与定期清理可能并发）
+_PROTECTED_ASSETS_LOCK = threading.Lock()
+
+
+class ChatCompletionHTTPError(RuntimeError):
+    """模型接口 HTTP 错误；消息格式与原先的 RuntimeError 一致，额外带状态码与 Retry-After。"""
+
+    def __init__(self, status: int, body: str, retry_after: Optional[int] = None) -> None:
+        super().__init__(f"HTTP {status}: {body}")
+        self.status = status
+        self.retry_after = retry_after
+
+
+def _parse_retry_after(value: Any) -> Optional[int]:
+    """Retry-After 只认 1-120 秒的整数；日期格式与异常值一律忽略。"""
+    try:
+        seconds = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return seconds if 1 <= seconds <= 120 else None
 
 try:  # pragma: no cover - 运行在 AstrBot 环境时会走真实导入
     from astrbot.api import AstrBotConfig
@@ -64,9 +161,10 @@ except Exception:  # pragma: no cover - 当前开发环境下使用兼容占位
             return self._data.get(key, default)
 
     class File:  # type: ignore[no-redef]
-        def __init__(self, name: str = "", url: str = "") -> None:
+        def __init__(self, name: str = "", url: str = "", file: str = "") -> None:
             self.name = name
             self.url = url
+            self.file = file
 
     def register(*_args: Any, **_kwargs: Any):
         def decorator(cls: Any) -> Any:
@@ -106,6 +204,19 @@ class MessageAttachment:
 
 
 @dataclass(slots=True)
+class OrientationBudget:
+    """一条消息内方向判定的共享预算：总时限 + 上游一旦失败就熔断。"""
+
+    deadline: float
+    failed: bool = False
+
+    def timeout(self) -> int:
+        if self.failed:
+            return 0
+        return int(min(ORIENTATION_TIMEOUT_SECONDS, self.deadline - time.monotonic()))
+
+
+@dataclass(slots=True)
 class ParsedMessage:
     text: str = ""
     reply_text: str = ""
@@ -127,6 +238,39 @@ class CommandResponse:
     message: str
     compile_result: Optional[CompileResult] = None
     file_payload: Optional[dict[str, Any]] = None
+    # 编译失败自动净化重试成功时携带修复后的源码，供上层同步会话存档与落盘版本
+    repaired_source: Optional[str] = None
+
+
+@dataclass(slots=True)
+class ModelDirective:
+    """「指定模型」指令的解析结果。
+
+    persistent=True：「切换到X模型」，持久改全局默认；
+    persistent=False：「用/使用X模型回答」，只对单题生效——
+    question 非空时直接用它回答本题，为空时作为本会话下一题的一次性预设。
+    """
+
+    model: str
+    persistent: bool
+    question: str = ""
+
+
+@dataclass(slots=True)
+class AnswerJob:
+    """一题的作答参数。单题与多题共用同一条作答→编译→存档→回写链路。"""
+
+    command_text: str
+    question_text: str
+    # 多题模式：共享的附件上下文（OCR 只跑一次）与「只答第 N 题」的聚焦说明
+    attachment_context: Optional[str] = None
+    focus: str = ""
+    # 多题模式：同一条 QQ 消息拆出多条回写记录，幂等键需按题区分
+    external_id_suffix: str = ""
+    # 多题模式：「第N题」，用作 PDF 标题前缀与失败消息前缀
+    label: str = ""
+    # 多题模式：副标题「围绕问题：…」用用户原话；题干带 LaTeX，放进副标题会被当纯文本转义
+    subtitle_question: str = ""
 
 
 @dataclass(slots=True)
@@ -141,6 +285,342 @@ class SessionMemory:
 
     def clear(self) -> None:
         self.rounds.clear()
+
+
+@dataclass(slots=True)
+class HttpResponse:
+    """传输层统一响应：HTTP 错误（4xx/5xx）也转成本对象返回，不抛异常。"""
+
+    status: int
+    body: dict[str, Any]
+
+
+class WritebackError(RuntimeError):
+    """回写链路的永久性失败。携带 HTTP status（网络层失败时为 None），
+    供上层记录日志与重试决策；可重试情形（网络错/429/5xx）在客户端内部消化，
+    抛到调用方时一律代表「不应再重试」。"""
+
+    def __init__(self, message: str, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+@dataclass(slots=True)
+class WritebackJob:
+    """回写队列元素：入队时刻冻结全部字段，worker 消费时不再依赖外部状态。"""
+
+    external_id: str
+    payload: dict[str, Any]
+    enqueued_at: float
+
+
+class HttpTransport:
+    """传输层当前实现：标准库 urllib，同步阻塞。
+
+    与 `_post_chat_completion` 的关键差异：HTTPError 被捕获并读取正文，
+    转成带 status 的 HttpResponse 返回（而不是直接抛 RuntimeError）——
+    这是上层重试矩阵能区分 401/429/5xx/4xx 的前提。网络层异常原样上抛。
+    升级传输层时整体替换本类即可，签名保持不变。
+    """
+
+    user_agent = f"astrbot-plugin-xelatex-pdf/{PLUGIN_VERSION}"
+
+    def post_json(self, url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int) -> HttpResponse:
+        """POST JSON 请求；4xx/5xx 转为 HttpResponse 返回，网络异常上抛。"""
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        merged_headers = {"Content-Type": "application/json", "User-Agent": self.user_agent}
+        merged_headers.update(headers)
+        return self._perform(url, encoded, merged_headers, timeout)
+
+    def post_form(self, url: str, form: dict[str, str], headers: dict[str, str], timeout: int) -> HttpResponse:
+        """application/x-www-form-urlencoded 请求（令牌端点专用）。"""
+        encoded = urllib.parse.urlencode(form).encode("utf-8")
+        merged_headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": self.user_agent}
+        merged_headers.update(headers)
+        return self._perform(url, encoded, merged_headers, timeout)
+
+    def _perform(self, url: str, encoded_body: bytes, headers: dict[str, str], timeout: int) -> HttpResponse:
+        request = urllib.request.Request(url, data=encoded_body, method="POST")
+        for key, value in headers.items():
+            request.add_header(key, value)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return HttpResponse(status=response.status, body=self._decode_body(response.read()))
+        except urllib.error.HTTPError as exc:
+            # 4xx/5xx 不抛异常：读取错误正文尽力解析为 JSON，交给上层决策
+            try:
+                raw_body = exc.read()
+            except Exception:
+                raw_body = b""
+            return HttpResponse(status=exc.code, body=self._decode_body(raw_body))
+
+    @staticmethod
+    def _decode_body(raw: bytes) -> dict[str, Any]:
+        if not raw:
+            return {}
+        try:
+            decoded = json.loads(raw.decode("utf-8", errors="replace"))
+        except (ValueError, UnicodeDecodeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
+
+class QaWritebackClient:
+    """题库开放 API 回写客户端：令牌缓存 + 三步 POST + 单请求重试。
+
+    线程安全说明：当前仅被单个 worker 线程调用；令牌状态仍由
+    threading.Lock 保护（双重检查），为多 worker 升级预留。
+    """
+
+    def __init__(
+        self,
+        transport: HttpTransport,
+        base_url: str,
+        client_id: str,
+        client_secret: str,
+        timeout: int = WRITEBACK_TIMEOUT_SECONDS,
+    ) -> None:
+        self._transport = transport
+        self._base_url = (base_url or "").rstrip("/")
+        self._client_id = client_id or ""
+        self._client_secret = client_secret or ""
+        self._timeout = timeout
+        self._token: str = ""
+        self._token_deadline: float = 0.0
+        self._token_lock = threading.Lock()
+
+    def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """执行 ①提问 ②答复 ③归档 全链路，返回摘要（供日志）。
+
+        部分成功语义：三步不是事务。① 失败则整任务终止（抛
+        WritebackError）；②/③ 失败只记日志不重跑——重试只发生在单个
+        HTTP 请求层面，避免答复步骤产生重复追加行。
+        """
+        external_id = str(payload.get("external_id", ""))
+        request_body = {
+            "external_id": external_id,
+            "channel": "qq_bot",
+            "channel_subject": payload.get("qq", ""),
+            "qq": payload.get("qq", ""),
+            "question_text": payload.get("question_text", ""),
+            "question_images": list(payload.get("question_images") or []),
+            "meta": dict(payload.get("meta") or {}),
+        }
+        request_result = self._post_with_auth("/api/open/v1/qa/requests", request_body)
+        request_record = request_result.get("request") if isinstance(request_result.get("request"), dict) else None
+        qa_request_id = request_record.get("id") if isinstance(request_record, dict) else None
+        if qa_request_id is None:
+            raise WritebackError("qa/requests 响应缺少 request.id", status=None)
+        deduplicated = bool(request_result.get("deduplicated"))
+
+        answer_step_ok = False
+        try:
+            self._post_with_auth(
+                f"/api/open/v1/qa/requests/{qa_request_id}/answer",
+                {
+                    "answer_text": payload.get("answer_text") or "（模型未给出答案）",
+                    "analysis_text": payload.get("analysis_text", ""),
+                    "external_ref": (payload.get("meta") or {}).get("pdf_url", ""),
+                },
+            )
+            answer_step_ok = True
+        except WritebackError as exc:
+            logger.warning(
+                "%s 答复步骤失败（不影响归档步骤） external_id=%s status=%s err=%s",
+                WRITEBACK_LOG_PREFIX, external_id, exc.status, exc,
+            )
+
+        archive_step_ok = False
+        try:
+            self._post_with_auth(
+                "/api/open/v1/archive/entries",
+                {
+                    "qa_request_id": qa_request_id,
+                    "external_id": external_id,
+                    "draft": dict(payload.get("draft") or {}),
+                },
+            )
+            archive_step_ok = True
+        except WritebackError as exc:
+            logger.warning(
+                "%s 归档步骤失败 external_id=%s status=%s err=%s",
+                WRITEBACK_LOG_PREFIX, external_id, exc.status, exc,
+            )
+
+        return {
+            "qa_request_id": qa_request_id,
+            "deduplicated": deduplicated,
+            "answer_step_ok": answer_step_ok,
+            "archive_step_ok": archive_step_ok,
+        }
+
+    def _get_token(self, force_refresh: bool = False) -> str:
+        """取缓存令牌；过期（或强制刷新）时在锁内重新申请，双重检查避免重复刷新。"""
+        if not force_refresh and self._token and time.monotonic() < self._token_deadline:
+            return self._token
+        with self._token_lock:
+            if not force_refresh and self._token and time.monotonic() < self._token_deadline:
+                return self._token
+            token, expires_in = self._request_token()
+            self._token = token
+            self._token_deadline = time.monotonic() + max(float(expires_in), 0.0) - TOKEN_EXPIRY_MARGIN_SECONDS
+            logger.info("%s 令牌刷新成功（expires_in=%ss）", WRITEBACK_LOG_PREFIX, expires_in)
+            return self._token
+
+    def _request_token(self) -> tuple[str, float]:
+        """client_credentials 换取令牌；按重试矩阵处理瞬时故障，最终失败抛 WritebackError。"""
+        credentials = base64.b64encode(f"{self._client_id}:{self._client_secret}".encode("utf-8")).decode("ascii")
+        url = f"{self._base_url}/api/oauth/token"
+        headers = {"Authorization": f"Basic {credentials}"}
+        form = {"grant_type": "client_credentials"}
+        last_error: Optional[WritebackError] = None
+        for attempt in range(1, WRITEBACK_MAX_ATTEMPTS + 1):
+            try:
+                response = self._transport.post_form(url, form, headers, self._timeout)
+            except Exception as exc:  # 网络层异常：可重试
+                last_error = WritebackError(f"令牌请求网络错误: {exc}", status=None)
+            else:
+                if response.status in (200, 201):
+                    token = response.body.get("access_token")
+                    expires_in = response.body.get("expires_in")
+                    if isinstance(token, str) and token and expires_in is not None:
+                        try:
+                            return token, float(expires_in)
+                        except (TypeError, ValueError):
+                            last_error = WritebackError("令牌响应 expires_in 非法", status=response.status)
+                    else:
+                        # 响应体缺字段：重试无意义，永久失败
+                        raise WritebackError("令牌响应缺少 access_token/expires_in", status=response.status)
+                elif response.status in (429,) or 500 <= response.status < 600:
+                    last_error = WritebackError("令牌请求瞬时失败", status=response.status)
+                else:
+                    raise WritebackError("令牌请求被拒绝（凭据或权限问题）", status=response.status)
+            if attempt < WRITEBACK_MAX_ATTEMPTS:
+                time.sleep(self._retry_delay(attempt))
+        assert last_error is not None
+        raise last_error
+
+    def _post_with_auth(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        """带 Bearer 头的 POST；401 → 强制刷新令牌重发一次（仅一次）。"""
+        url = f"{self._base_url}{path}"
+        response = self._post_with_retry(url, {"Authorization": f"Bearer {self._get_token()}"}, body)
+        if response.status == 401:
+            logger.info("%s 业务请求收到 401，强制刷新令牌重发一次 path=%s", WRITEBACK_LOG_PREFIX, path)
+            response = self._post_with_retry(url, {"Authorization": f"Bearer {self._get_token(force_refresh=True)}"}, body)
+        if response.status in (200, 201):
+            return response.body
+        raise WritebackError(f"请求失败 path={path}", status=response.status)
+
+    def _post_with_retry(self, url: str, headers: dict[str, str], body: dict[str, Any]) -> HttpResponse:
+        """单请求重试矩阵：网络错/429/5xx 退避重发（≤3 次）；401 交给调用方续期；
+        其余 4xx 永久失败立即抛出。返回的 HttpResponse 由调用方判定成功与否。"""
+        last_error: Optional[WritebackError] = None
+        for attempt in range(1, WRITEBACK_MAX_ATTEMPTS + 1):
+            try:
+                response = self._transport.post_json(url, body, headers, self._timeout)
+            except Exception as exc:  # URLError / socket.timeout / ConnectionError 等：可重试
+                last_error = WritebackError(f"网络错误: {exc}", status=None)
+            else:
+                if response.status == 401:
+                    return response
+                if response.status in (429,) or 500 <= response.status < 600:
+                    last_error = WritebackError("服务端瞬时失败", status=response.status)
+                else:
+                    # 2xx 成功，或 400/403/404 等永久失败：都不重试
+                    return response
+            if attempt < WRITEBACK_MAX_ATTEMPTS:
+                time.sleep(self._retry_delay(attempt))
+        assert last_error is not None
+        raise last_error
+
+    @staticmethod
+    def _retry_delay(attempt: int) -> float:
+        """指数退避 + 抖动：约 1s、2s……"""
+        return WRITEBACK_RETRY_BASE_DELAY * 2 ** (attempt - 1) + random.uniform(0, 0.5)
+
+
+class WritebackScheduler:
+    """回写调度/队列层：有界队列 + 单 daemon worker 线程。
+
+    只依赖「一个可调用的 submit_fn(payload) -> dict」，不感知
+    HTTP/令牌/题库契约——那是 QaWritebackClient 的事。
+    submit_fn 为 None（未配置/开关关闭）时，enqueue 静默 no-op。
+    """
+
+    def __init__(self, submit_fn: Optional[Any] = None, maxsize: int = WRITEBACK_QUEUE_MAXSIZE) -> None:
+        self._submit_fn = submit_fn
+        self._queue: "queue.Queue[Optional[WritebackJob]]" = queue.Queue(maxsize=maxsize)
+        self._workers: list[threading.Thread] = []
+        self._started = False
+
+    @property
+    def enabled(self) -> bool:
+        return self._submit_fn is not None
+
+    def enqueue(self, payload: dict[str, Any]) -> bool:
+        """同步、非阻塞、永不抛错。入队成功返回 True；
+        队列满丢弃返回 False（已记 WARNING）；未启用返回 False。"""
+        if self._submit_fn is None:
+            return False
+        try:
+            external_id = str(payload.get("external_id", ""))
+            job = WritebackJob(external_id=external_id, payload=payload, enqueued_at=time.time())
+            self._queue.put_nowait(job)
+        except queue.Full:
+            logger.warning(
+                "%s 回写队列已满，丢弃本次任务 external_id=%s",
+                WRITEBACK_LOG_PREFIX, payload.get("external_id", ""),
+            )
+            return False
+        except Exception as exc:  # 兜底：生产端任何异常都不允许上抛
+            logger.warning("%s 入队异常（已忽略） err=%s", WRITEBACK_LOG_PREFIX, exc)
+            return False
+        logger.debug("%s 回写任务已入队 external_id=%s pending=%d", WRITEBACK_LOG_PREFIX, external_id, self._queue.qsize())
+        return True
+
+    def start(self) -> None:
+        """幂等启动 worker 线程；未启用时不做任何事。"""
+        if self._submit_fn is None or self._started:
+            return
+        self._started = True
+        worker = threading.Thread(target=self._worker_loop, name="qbk-writeback-worker", daemon=True)
+        worker.start()
+        self._workers.append(worker)
+
+    def stop(self) -> None:
+        """发送哨兵，worker 排空队列内剩余任务后退出；限时 join 5s，超时不等待。"""
+        if not self._started:
+            return
+        self._started = False
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:  # 理论上哨兵入队不会满（worker 在消费），兜底不阻塞
+            pass
+        for worker in self._workers:
+            if worker.is_alive():
+                worker.join(5)
+        self._workers.clear()
+
+    def pending_count(self) -> int:
+        """观测用：队列中待处理任务数。"""
+        return self._queue.qsize()
+
+    def _worker_loop(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is None:  # 哨兵：排空后退出
+                break
+            try:
+                summary = self._submit_fn(job.payload)
+                logger.info(
+                    "%s 回写成功 external_id=%s qa_request_id=%s deduplicated=%s",
+                    WRITEBACK_LOG_PREFIX,
+                    job.external_id,
+                    summary.get("qa_request_id") if isinstance(summary, dict) else None,
+                    summary.get("deduplicated") if isinstance(summary, dict) else None,
+                )
+            except Exception as exc:  # 兜底：任何异常只记日志，绝不上抛
+                logger.warning("%s 回写失败 external_id=%s err=%s", WRITEBACK_LOG_PREFIX, job.external_id, exc)
 
 
 @register("astrbot_plugin_xelatex_pdf", "CodeBuddy", "使用 XeLaTeX 生成 PDF 的 AstrBot 插件", PLUGIN_VERSION)
@@ -183,6 +663,8 @@ class Plugin(Star):
         self.last_pdf_by_session: dict[str, Path] = {}
         # 记录每个会话最近一次生成的命名基名，保证源码/日志/PDF 三类文件同名对应
         self.last_base_name_by_session: dict[str, str] = {}
+        # 「用X模型回答」单次指定：按会话暂存，下一题消费一次即清除，不碰全局默认
+        self.pending_model_by_session: dict[str, str] = {}
         self.text_api_url = self._get_config_value("text_api_url", "XELATEX_TEXT_API_URL", "").rstrip("/")
         self.text_api_key = self._get_config_value("text_api_key", "XELATEX_TEXT_API_KEY", "")
         self.ocr_api_url = self._get_config_value("ocr_api_url", "XELATEX_OCR_API_URL", self.text_api_url).rstrip("/")
@@ -209,17 +691,86 @@ class Plugin(Star):
         self.public_file_host = self._get_config_value("file_server_host", "XELATEX_FILE_SERVER_HOST", "")
         self._file_server: ThreadingHTTPServer | None = None
         self._file_server_thread: threading.Thread | None = None
+        self._load_panel_settings()
+        self._cleanup_task: Optional[asyncio.Task] = None
+        # 答疑归档回写题库：读配置并做启用判定。四项任一缺失/开关关闭时
+        # 挂空转调度器（enqueue no-op），不产生启动错误——回写是旁路。
+        self.qbk_base_url = str(self._get_config_value("qbk_base_url", "XELATEX_QBK_BASE_URL", "http://172.17.0.1:3000") or "").rstrip("/")
+        self.qbk_client_id = str(self._get_config_value("qbk_client_id", "XELATEX_QBK_CLIENT_ID", "") or "")
+        self.qbk_client_secret = str(self._get_config_value("qbk_client_secret", "XELATEX_QBK_CLIENT_SECRET", "") or "")
+        self.archive_enabled = str(self._get_config_value("archive_enabled", "XELATEX_ARCHIVE_ENABLED", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
+        self.writeback_scheduler = WritebackScheduler(submit_fn=None)
+        if self.archive_enabled and self.qbk_base_url and self.qbk_client_id and self.qbk_client_secret:
+            writeback_client = QaWritebackClient(HttpTransport(), self.qbk_base_url, self.qbk_client_id, self.qbk_client_secret)
+            self.writeback_scheduler = WritebackScheduler(submit_fn=writeback_client.submit)
+            self.writeback_scheduler.start()
+            logger.info("%s 归档回写已启用 base_url=%s", WRITEBACK_LOG_PREFIX, self.qbk_base_url)
+        else:
+            logger.info("%s 归档回写未启用（开关关闭或凭据未配置）", WRITEBACK_LOG_PREFIX)
         self._start_file_server()
+
+    def _load_panel_settings(self) -> None:
+        """读取 WebUI 面板上的开关与数值。面板只做类型转换，范围在这里夹住。
+
+        面板保存后 AstrBot 会热重载插件（先 terminate 旧实例再重新构造），这里随之重读。
+        """
+        self.multi_question_enabled = self._config_bool("multi_question_enabled", "XELATEX_MULTI_QUESTION_ENABLED", True)
+        self.orientation_correction_enabled = self._config_bool("orientation_correction_enabled", "XELATEX_ORIENTATION_CORRECTION_ENABLED", True)
+        # 回复上限至少 2：多题模式缺题/超额时要 1 条说明 + 至少 1 份 PDF
+        self.reply_limit_group = self._config_int("reply_limit_group", "XELATEX_REPLY_LIMIT_GROUP", QQ_OFFICIAL_GROUP_REPLY_SLOTS, 2, 20)
+        self.reply_limit_private = self._config_int("reply_limit_private", "XELATEX_REPLY_LIMIT_PRIVATE", QQ_OFFICIAL_C2C_REPLY_SLOTS, 2, 20)
+        self.reply_limit_other = self._config_int("reply_limit_other", "XELATEX_REPLY_LIMIT_OTHER", DEFAULT_REPLY_SLOTS, 2, 20)
+        self.file_retention_days = self._config_int("file_retention_days", "XELATEX_FILE_RETENTION_DAYS", 7, 0, 3650)
+        self.cleanup_interval_hours = self._config_int("cleanup_interval_hours", "XELATEX_CLEANUP_INTERVAL_HOURS", CLEANUP_INTERVAL_SECONDS // 3600, 1, 168)
+
+    def _config_bool(self, key: str, env_key: str, default: bool) -> bool:
+        value = self._get_config_value(key, env_key, default)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _config_int(self, key: str, env_key: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(self._get_config_value(key, env_key, default))
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, min(maximum, value))
 
     async def initialize(self) -> None:
         """插件启动钩子。"""
         self.initialized = True
-        await asyncio.to_thread(self._cleanup_stale_workdirs)
         self._start_file_server()
+        # 启动（含面板保存后的热重载）即清理一轮，之后每 cleanup_interval_hours 一轮
+        if getattr(self, "_cleanup_task", None) is None:
+            self._cleanup_task = asyncio.create_task(self._periodic_cleanup_loop())
         return None
 
+    async def _periodic_cleanup_loop(self) -> None:
+        while True:
+            try:
+                removed = await asyncio.to_thread(self._cleanup_expired_files)
+                await asyncio.to_thread(self._cleanup_stale_workdirs)
+                if any(removed.values()):
+                    logger.info("定期清理完成 %s", " ".join(f"{name}={count}" for name, count in removed.items()))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("定期清理失败（下轮重试） err=%s", exc)
+            interval_hours = getattr(self, "cleanup_interval_hours", CLEANUP_INTERVAL_SECONDS // 3600)
+            await asyncio.sleep(interval_hours * 3600)
+
     async def terminate(self) -> None:
-        """插件卸载时关闭内置文件服务。"""
+        """插件卸载时停止定期清理与回写调度器，并关闭内置文件服务。"""
+        cleanup_task = getattr(self, "_cleanup_task", None)
+        self._cleanup_task = None
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+            # asyncio.wait 不抛任务异常，也不吞掉 terminate 自身被取消（卸载超时）的信号
+            await asyncio.wait([cleanup_task], timeout=5)
+        scheduler = getattr(self, "writeback_scheduler", None)
+        if scheduler is not None:
+            # 哨兵排空 + 限时 join；worker 是 daemon 线程，超时不阻塞卸载
+            await asyncio.to_thread(scheduler.stop)
         server = self._file_server
         self._file_server = None
         self.initialized = False
@@ -246,9 +797,12 @@ class Plugin(Star):
 
     @filter.command("ai", alias={"ask", "解答", "解析"})
     async def handle_ai(self, event: AstrMessageEvent):
-        response = await self.handle_event(event)
-        async for result in self._yield_response(event, response):
-            yield result
+        # 多题模式一条指令产出多份回复：每个 yield 由 AstrBot 各自作为一条被动回复发送。
+        # aclosing：AstrBot 提前停止消费时逐层关闭，未完成的题立即取消而不是等 GC
+        async with aclosing(self.handle_event_stream(event)) as responses:
+            async for response in responses:
+                async for result in self._yield_response(event, response):
+                    yield result
 
     @filter.command("查模型")
     async def handle_model_list(self, event: AstrMessageEvent):
@@ -273,14 +827,16 @@ class Plugin(Star):
     async def _yield_response(self, event: AstrMessageEvent, response: CommandResponse):
         if response.file_payload:
             file_payload = response.file_payload
+            # 直接发送文件本体，不向用户推送下载链接文本
+            if hasattr(event, "chain_result"):
+                yield event.chain_result([File(name=file_payload["name"], file=file_payload.get("path", ""), url=file_payload.get("url", ""))])
+                return
+            # 兜底：平台不支持文件消息段时，回退为文本 + 下载链接
             fallback_message = response.message
             if file_payload.get("url"):
                 fallback_message = f"{response.message}\n下载链接：{file_payload['url']}"
             if hasattr(event, "plain_result") and fallback_message:
                 yield event.plain_result(fallback_message)
-            if hasattr(event, "chain_result"):
-                yield event.chain_result([File(name=file_payload["name"], url=file_payload["url"])])
-                return
             return
         if hasattr(event, "plain_result"):
             yield event.plain_result(response.message)
@@ -288,52 +844,113 @@ class Plugin(Star):
             yield response.message
 
     async def handle_event(self, event: Any) -> CommandResponse:
+        """单响应入口（兼容旧调用方）：返回流里的最后一条回复。"""
+        last: Optional[CommandResponse] = None
+        async for response in self.handle_event_stream(event):
+            last = response
+        return last or CommandResponse(success=False, message="消息中没有可处理的命令")
+
+    async def handle_event_stream(self, event: Any):
         session_id = self.get_session_id(event)
         parsed_message = await self.parse_message(event)
         command_text = self._extract_command_text(parsed_message)
+        override_model: Optional[str] = None
         if not command_text:
             fallback_text = (parsed_message.text or parsed_message.reply_text or "").strip()
             if fallback_text:
                 command_text = f"/ai {fallback_text}"
             else:
-                model_switch = self._extract_model_switch(parsed_message.text or parsed_message.reply_text)
-                if model_switch:
-                    self._set_active_model(model_switch)
-                    return CommandResponse(success=True, message=f"已切换模型：{model_switch}")
-                return CommandResponse(success=False, message="消息中没有可处理的命令")
+                directive = self._extract_model_switch(parsed_message.text or parsed_message.reply_text)
+                if directive is not None:
+                    response = self._apply_model_directive(directive, session_id)
+                    if response is not None:
+                        yield response
+                        return
+                yield CommandResponse(success=False, message="消息中没有可处理的命令")
+                return
 
-        model_switch = self._extract_model_switch(self._extract_user_question(command_text))
-        if model_switch:
-            self._set_active_model(model_switch)
-            return CommandResponse(success=True, message=f"已切换模型：{model_switch}")
+        directive = self._extract_model_switch(self._extract_user_question(command_text))
+        if directive is not None:
+            response = self._apply_model_directive(directive, session_id)
+            if response is not None:
+                yield response
+                return
+            # 单次指定且同条消息带问题：重建命令直接回答本题，不触碰全局默认模型
+            command_text = f"/ai {directive.question}"
+            override_model = directive.model
 
         if self._is_source_export_command(command_text):
-            return await asyncio.to_thread(
+            yield await asyncio.to_thread(
                 self.handle_command,
                 command_text,
                 session_id=session_id,
             )
+            return
 
         request = self.parse_command(command_text)
-        if request is not None and (request.args[:1] == ["clear"] or "-m" in request.args):
-            return await asyncio.to_thread(
+        if request is not None and request.args[:1] == ["clear"]:
+            yield await asyncio.to_thread(
                 self.handle_command,
                 command_text,
                 session_id=session_id,
             )
+            return
+        if request is not None and "-m" in request.args:
+            # -m 一律单次生效：带问题 → 用指定模型回答本题；不带问题 → 预设本会话下一题
+            m_model, m_question = self._extract_m_flag(request.args)
+            if not m_question:
+                if m_model:
+                    self.pending_model_by_session[session_id] = m_model
+                    yield CommandResponse(
+                        success=True,
+                        message=f"已为下一题指定模型：{m_model}（仅本会话下一题生效，不影响全局）",
+                    )
+                    return
+                yield CommandResponse(success=False, message="未指定模型：请在 -m 后填写模型名")
+                return
+            command_text = f"/ai {m_question}"
+            override_model = m_model
 
+        question_text = self._extract_user_question(command_text)
+        numbers = self._extract_question_numbers(question_text) if getattr(self, "multi_question_enabled", False) else []
         parsed_message = await asyncio.to_thread(self.localize_attachments, parsed_message)
+        # 多题只在有题图/引用可找题时拆；纯文字提问里出现多个题号仍按原方式整体作答
+        if numbers and (parsed_message.images or parsed_message.pdfs or parsed_message.reply_text):
+            async with aclosing(self._answer_multiple(event, session_id, parsed_message, command_text, numbers, override_model)) as responses:
+                async for response in responses:
+                    yield response
+            return
+        yield await self._answer_job(event, session_id, parsed_message, AnswerJob(command_text=command_text, question_text=question_text), override_model)
+
+    async def _answer_job(
+        self,
+        event: Any,
+        session_id: str,
+        parsed_message: ParsedMessage,
+        job: AnswerJob,
+        override_model: Optional[str],
+    ) -> CommandResponse:
+        """一题的作答→排版→编译→存档→回写。单题与多题（每题一次、并发）共用。"""
+        command_text = job.command_text
+        question_text = job.question_text
 
         answer_text, used_model = await asyncio.to_thread(
             self.generate_answer,
             command_text,
             parsed_message,
             session_id,
+            override_model,
+            attachment_context=job.attachment_context,
+            focus=job.focus,
         )
-        self._set_active_model(used_model)
-        question_text = self._extract_user_question(command_text)
+        # 注意：不得把 used_model 写回 active_model_name——
+        # 那会把单次指定或降级用到的模型固化成全局默认，污染所有会话
         # 解析 LLM 返回的 [TITLE]/[SUMMARY] 结构化标记，标题与提要由模型生成
         structured = self._parse_structured_answer(answer_text)
+        if job.label:
+            # 多份 PDF 靠标题里的题号区分
+            structured["title"] = f"{job.label} {structured['title']}".strip()
+        subtitle_options = {"subtitle_question": job.subtitle_question} if job.subtitle_question else {}
         tex_source = await asyncio.to_thread(
             self.build_tex_source,
             parsed_message,
@@ -341,6 +958,7 @@ class Plugin(Star):
             question_text=question_text,
             title_override=structured["title"],
             summary_override=structured["summary"],
+            **subtitle_options,
         )
         self.last_tex_source_by_session[session_id] = tex_source
         # 统一命名：QQ号_题目关键词_时间戳；源码/日志/PDF 三类文件共用同一基名
@@ -356,12 +974,113 @@ class Plugin(Star):
             base_name=base_name,
         )
 
+        # 编译失败净化重试成功时，会话存档与落盘源码都要换成修复后版本，
+        # 否则 /源文件 导出的还是编译不过的旧源码
+        if response.repaired_source:
+            tex_source = response.repaired_source
+            self.last_tex_source_by_session[session_id] = tex_source
+            await asyncio.to_thread(self._persist_tex_source, base_name, tex_source)
+
         if response.success and response.compile_result and response.compile_result.success:
             self.append_history(session_id, question_text, structured["body"])
             if response.file_payload and response.file_payload.get("path"):
                 self.last_pdf_by_session[session_id] = Path(response.file_payload["path"])
+            # 归档回写（旁路链路）：组 payload → 入队。失败隔离铁律：
+            # 这里任何异常都不允许改变 return response 的值。
+            try:
+                if structured["archive"]["present"]:
+                    writeback_payload = self._build_writeback_payload(
+                        event=event,
+                        question_text=question_text,
+                        structured=structured,
+                        parsed_message=parsed_message,
+                        session_id=session_id,
+                        base_name=base_name,
+                        used_model=used_model,
+                        response=response,
+                    )
+                    if job.external_id_suffix:
+                        writeback_payload["external_id"] += job.external_id_suffix
+                    self._enqueue_qa_writeback(writeback_payload)
+            except Exception as exc:
+                logger.warning("%s 回写组装/入队失败（已忽略） err=%s", WRITEBACK_LOG_PREFIX, exc)
 
+        if job.label and not response.file_payload:
+            response.message = f"{job.label}：{response.message}"
         return response
+
+    async def _answer_multiple(
+        self,
+        event: Any,
+        session_id: str,
+        parsed_message: ParsedMessage,
+        command_text: str,
+        numbers: list[int],
+        override_model: Optional[str],
+    ):
+        """一张图里的多道题：OCR 一次 → 找出各题题干 → 每题并行作答各出一份 PDF，谁先好先发。"""
+        # 会话级一次性预设只消费一次，所有题共用，不能被第一道完成的题吃掉
+        if not override_model:
+            override_model = (self.pending_model_by_session.pop(session_id, "") or "").strip() or None
+        slots = self._reply_slots(event)
+        attachment_context = await asyncio.to_thread(self._build_attachment_context, parsed_message)
+        stems = await asyncio.to_thread(self._split_questions, attachment_context, numbers, override_model)
+        if stems is None:
+            # 拆题失败不放弃：每题拿完整附件内容 + 「只答第 N 题」自行定位
+            found, missing = list(numbers), []
+            stems = {}
+        else:
+            found = [number for number in numbers if number in stems]
+            missing = [number for number in numbers if number not in stems]
+        if not found:
+            yield CommandResponse(
+                success=False,
+                message=f"没在图片/引用里找到{self._format_question_numbers(numbers)}，请确认题号或换一张更清晰的图",
+            )
+            return
+
+        # 回复次数有限：缺题或超额时占一次发说明，其余全给 PDF
+        capacity = slots
+        if missing or len(found) > slots:
+            capacity = slots - 1
+        answered, overflow = found[:capacity], found[capacity:]
+        notice = self._format_multi_question_notice(answered, missing, overflow)
+        jobs = [
+            AnswerJob(
+                command_text=command_text,
+                question_text=f"第{number}题：{stems[number]}" if stems.get(number) else f"第{number}题",
+                attachment_context=attachment_context,
+                focus=self._build_question_focus(number, answered, stems.get(number, "")),
+                external_id_suffix=f":q{number}",
+                label=f"第{number}题",
+                subtitle_question=self._extract_user_question(command_text),
+            )
+            for number in answered
+        ]
+        tasks = [asyncio.ensure_future(self._answer_job_safely(event, session_id, parsed_message, job, override_model)) for job in jobs]
+        try:
+            if notice:
+                yield CommandResponse(success=True, message=notice)
+            for next_done in asyncio.as_completed(tasks):
+                yield await next_done
+        finally:
+            for task in tasks:
+                task.cancel()
+
+    async def _answer_job_safely(
+        self,
+        event: Any,
+        session_id: str,
+        parsed_message: ParsedMessage,
+        job: AnswerJob,
+        override_model: Optional[str],
+    ) -> CommandResponse:
+        # 一题出错不能拖垮同批其他题
+        try:
+            return await self._answer_job(event, session_id, parsed_message, job, override_model)
+        except Exception as exc:
+            logger.warning("多题作答失败 %s err=%s", job.label, exc)
+            return CommandResponse(success=False, message=f"{job.label}：作答失败，请稍后单独重试这一题")
 
     async def parse_message(self, message: Any) -> ParsedMessage:
         parsed = ParsedMessage()
@@ -419,7 +1138,7 @@ class Plugin(Star):
             return CommandResponse(success=False, message="未识别的命令")
 
         if request.command in {"/查模型", "查模型"}:
-            return CommandResponse(success=True, message=self._format_model_list())
+            return CommandResponse(success=True, message=self._format_model_list(session_id=session_id))
 
         if request.command in {"/ai_source", "ai_source", "/源文件", "源文件"}:
             source = self.last_tex_source_by_session.get(session_id)
@@ -439,16 +1158,33 @@ class Plugin(Star):
             return CommandResponse(success=True, message="会话已清空")
 
         if "-m" in request.args:
-            model_index = request.args.index("-m")
-            model_name = request.args[model_index + 1] if model_index + 1 < len(request.args) else ""
+            # 单次生效：只预设本会话下一题，不改全局默认（带问题的形态由 handle_event 拦截）
+            model_name, _question = self._extract_m_flag(request.args)
             if model_name:
-                self._set_active_model(model_name)
-            return CommandResponse(success=True, message=f"已切换模型：{model_name or '未指定'}")
+                self.pending_model_by_session[session_id] = model_name
+            return CommandResponse(
+                success=True,
+                message=f"已为下一题指定模型：{model_name or '未指定'}（仅本会话下一题生效，不影响全局）",
+            )
 
         if tex_source is None:
             return CommandResponse(success=True, message="命令已接收，等待 TeX 内容")
 
         compile_result = self.compile_tex(tex_source)
+        repaired_source: Optional[str] = None
+        if not compile_result.success:
+            # 编译失败自动净化重试：仅针对已识别的错误模式修复后重试一次，
+            # 避免盲目重试掩盖真实错误
+            repaired = self._repair_tex_source(tex_source, compile_result)
+            if repaired is not None:
+                self._cleanup_compile_result(compile_result, base_name=base_name)
+                compile_result = self.compile_tex(repaired)
+                if compile_result.success:
+                    repaired_source = repaired
+                logger.info(
+                    "编译失败净化重试：%s",
+                    "成功" if compile_result.success else "仍失败",
+                )
         if compile_result.success:
             file_payload = self.build_file_payload(compile_result.pdf_path, base_name=base_name)
             if file_payload is None or not file_payload.get("path"):
@@ -460,6 +1196,7 @@ class Plugin(Star):
                     success=False,
                     message=message,
                     compile_result=compile_result,
+                    repaired_source=repaired_source,
                 )
             exported_path = Path(file_payload["path"])
             self._cleanup_compile_result(compile_result, exported_path=exported_path, base_name=base_name)
@@ -468,6 +1205,7 @@ class Plugin(Star):
                 message="编译成功",
                 compile_result=compile_result,
                 file_payload=file_payload,
+                repaired_source=repaired_source,
             )
         message = self.build_compile_error_message(compile_result)
         self._cleanup_compile_result(compile_result, base_name=base_name)
@@ -475,6 +1213,7 @@ class Plugin(Star):
             success=False,
             message=message,
             compile_result=compile_result,
+            repaired_source=repaired_source,
         )
 
     def _cleanup_compile_result(self, compile_result: CompileResult, exported_path: Optional[Path] = None, base_name: Optional[str] = None) -> None:
@@ -500,6 +1239,67 @@ class Plugin(Star):
             shutil.copyfile(log_path, target)
         except OSError:
             return
+
+    def _cleanup_expired_files(self) -> dict[str, int]:
+        """删除 assets/pdfs/sources/logs 下超过保留天数的文件，返回各目录删除数。
+
+        只动这四个目录的直接子文件（不递归、不跟随符号链接）；数据根目录下的
+        chat_history.json 与题库引用清单不在范围内。被题库热链的题图永不删除。
+        """
+        # 配置是整数天，0 关闭；最短也保留一天，不会删到正在作答、还没发出去的文件
+        retention_days = int(getattr(self, "file_retention_days", 0) or 0)
+        if retention_days <= 0:
+            return {}
+        cutoff = time.time() - retention_days * 24 * 60 * 60
+        protected = self._load_protected_assets()
+        removed: dict[str, int] = {}
+        for name, directory in (("assets", self.asset_dir), ("pdfs", self.pdf_dir), ("sources", self.source_dir), ("logs", self.log_dir)):
+            count = 0
+            try:
+                entries = list(Path(directory).iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    if entry.is_symlink() or not entry.is_file():
+                        continue
+                    if name == "assets" and entry.name in protected:
+                        continue
+                    if entry.stat().st_mtime >= cutoff:
+                        continue
+                    entry.unlink()
+                    count += 1
+                except OSError:
+                    continue
+            removed[name] = count
+        return removed
+
+    def _protected_assets_path(self) -> Path:
+        return Path(self.data_dir) / PROTECTED_ASSETS_FILENAME
+
+    def _load_protected_assets(self) -> set[str]:
+        """题库引用清单：回写时提交给题库的题图文件名。题库审阅板直接热链这些 URL，删了就永久裂图。"""
+        try:
+            data = json.loads(self._protected_assets_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return set()
+        return {str(item) for item in data} if isinstance(data, list) else set()
+
+    def _remember_protected_assets(self, image_urls: list[str]) -> None:
+        names = {Path(urllib.parse.urlsplit(url).path).name for url in image_urls if "/asset/" in url}
+        names.discard("")
+        if not names:
+            return
+        with _PROTECTED_ASSETS_LOCK:
+            merged = self._load_protected_assets() | names
+            path = self._protected_assets_path()
+            temp_path = path.with_name(f".{path.name}.tmp")
+            try:
+                temp_path.write_text(json.dumps(sorted(merged), ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(temp_path, path)
+            except OSError as exc:
+                temp_path.unlink(missing_ok=True)
+                logger.warning("题库引用清单写入失败 err=%s", exc)
 
     def _cleanup_stale_workdirs(self) -> None:
         temp_root = Path(tempfile.gettempdir()).resolve()
@@ -699,20 +1499,40 @@ class Plugin(Star):
             "如果适合，请优先使用定义、定理、性质、例题、注、笔记、证明、解答等环境。"
         )
 
-    def _build_user_render_prompt(self, question: str, parsed_message: ParsedMessage) -> str:
+    def _build_user_render_prompt(
+        self,
+        question: str,
+        parsed_message: ParsedMessage,
+        *,
+        attachment_context: Optional[str] = None,
+        focus: str = "",
+    ) -> str:
         parts = [f"用户原文：\n{question.strip()}"]
+        if focus:
+            parts.append(focus)
         if parsed_message.reply_text:
             parts.append(f"引用消息：\n{parsed_message.reply_text.strip()}")
         if parsed_message.text and parsed_message.text.strip() and parsed_message.text.strip() != question.strip():
             parts.append(f"补充文本：\n{parsed_message.text.strip()}")
-        attachment_context = self._build_attachment_context(parsed_message)
+        # 多题模式由调用方传入共享的附件上下文，OCR 不随题数重复
+        if attachment_context is None:
+            attachment_context = self._build_attachment_context(parsed_message)
         if attachment_context:
             parts.append(attachment_context)
         parts.append(self._build_render_instruction(question, parsed_message))
         parts.append("输出要求：不要输出完整 LaTeX 文档，不要寒暄，不要说无法识别；直接输出可插入模板正文的内容。")
         return "\n\n".join(parts)
 
-    def generate_answer(self, command_text: str, parsed_message: ParsedMessage, session_id: str) -> tuple[str, str]:
+    def generate_answer(
+        self,
+        command_text: str,
+        parsed_message: ParsedMessage,
+        session_id: str,
+        override_model: Optional[str] = None,
+        *,
+        attachment_context: Optional[str] = None,
+        focus: str = "",
+    ) -> tuple[str, str]:
         question = self._extract_user_question(command_text)
         if not question:
             question = parsed_message.text.strip() if parsed_message.text.strip() else "请给出回应。"
@@ -737,6 +1557,18 @@ class Plugin(Star):
                     "也可以用 Markdown 标题写“## 定义”“#### 例 1”“#### 注”等，外部程序会自动转换为 ElegantBook 环境。"
                     "数学要求：行内公式优先使用 \\(...\\) 或 $...$；行间公式使用 \\[...\\] 或 $$...$$；可使用 amsmath/amsfonts/amssymb 常见命令，如 \\mathbb、\\varepsilon、\\delta、\\Rightarrow。"
                     "内容要求：直接回答用户问题，不要寒暄，不要说“下面是”。标题与提要必须根据本次回答的实际内容撰写，不要写空话套话。"
+                    "归档要求（供程序自动读取）：如果你判断本次回答完整解答了一道可收录的题目（题干条件充分、解答完整），"
+                    "请在正文最后空一行，输出如下归档块，块内每行一个标记、顺序固定："
+                    "[ARCHIVE]"
+                    "[STEM] 规范题干：把用户口语化提问或图片转述整理为正式题目表述，保留全部已知条件与数学符号（行内公式用 $...$），"
+                    "不遗漏条件，不混入解答内容；选择题须把选项完整写入（A. … B. …）"
+                    "[ANSWER] 最终答案：一行给出（选择题写选项字母，填空题写结果，证明/论述题写“见解析”）"
+                    "[TYPE] 题型：single（单选）/ multiple（多选）/ blank（填空）/ proof（证明）/ calc（计算）/ answer（解答）六选一"
+                    "[DIFFICULTY] 难度：1-5 的整数（1 最易）"
+                    "[TAGS] 知识点：至多 5 个标签，用英文逗号分隔，例如 极限,洛必达法则,中值定理"
+                    "[/ARCHIVE]"
+                    "若本次内容不是完整题目（闲聊、工具命令、绘图请求、条件不全、追问讨论），不要输出归档块。"
+                    "归档块会被程序剥离、不排版进 PDF；标记格式必须严格一致。"
                     "禁止输出：\\documentclass、\\begin{document}、\\end{document}、\\usepackage、\\author、\\date、\\maketitle、页眉页脚设置、模型名、回答时间、作者信息。"
                     "不要把模型名或回答时间放在正文开头；这些元信息由外部模板写入页脚。"
                 ),
@@ -752,9 +1584,22 @@ class Plugin(Star):
                 if assistant_text:
                     messages.append({"role": "assistant", "content": assistant_text})
 
-        messages.append({"role": "user", "content": self._build_user_render_prompt(question, parsed_message)})
+        messages.append(
+            {
+                "role": "user",
+                "content": self._build_user_render_prompt(
+                    question,
+                    parsed_message,
+                    attachment_context=attachment_context,
+                    focus=focus,
+                ),
+            }
+        )
 
-        model_queue = self._build_model_queue()
+        model_queue = self._build_model_queue(
+            override_model=override_model,
+            session_id=session_id,
+        )
         last_error = ""
         for model_name in model_queue:
             try:
@@ -768,13 +1613,30 @@ class Plugin(Star):
         return f"文本模型调用失败：{last_error or '模型未返回内容'}", self.active_model_name
 
     def _call_text_model(self, model_name: str, messages: list[dict[str, str]]) -> str:
-        data = self._post_chat_completion(
-            api_url=self.text_api_url,
-            api_key=self.text_api_key,
-            payload={"model": model_name, "messages": messages},
-            timeout=MODEL_TIMEOUT_SECONDS,
-        )
-        return self._extract_chat_content(data)
+        global _text_model_cool_until
+        attempt = 0
+        while True:
+            # 共享退避：任一并发请求被限流后，所有文本请求一起等，不去反复撞限流的账号
+            with _TEXT_MODEL_COOLDOWN_LOCK:
+                wait = _text_model_cool_until - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                data = self._post_chat_completion(
+                    api_url=self.text_api_url,
+                    api_key=self.text_api_key,
+                    payload={"model": model_name, "messages": messages},
+                    timeout=MODEL_TIMEOUT_SECONDS,
+                )
+                return self._extract_chat_content(data)
+            except ChatCompletionHTTPError as exc:
+                if exc.status not in THROTTLED_STATUS_CODES or attempt >= TEXT_MODEL_THROTTLE_RETRIES:
+                    raise
+                delay = min(exc.retry_after or 4 * 2 ** attempt, TEXT_MODEL_MAX_BACKOFF_SECONDS)
+                with _TEXT_MODEL_COOLDOWN_LOCK:
+                    _text_model_cool_until = max(_text_model_cool_until, time.monotonic() + delay)
+                logger.info("文本模型限流退避 model=%s status=%s delay=%ss attempt=%d", model_name, exc.status, delay, attempt + 1)
+                attempt += 1
 
     def _post_chat_completion(self, api_url: str, api_key: str, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -787,7 +1649,8 @@ class Plugin(Star):
                 data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="ignore")[:500]
-            raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
+            retry_after = _parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
+            raise ChatCompletionHTTPError(exc.code, body, retry_after) from exc
         if not isinstance(data, dict):
             raise RuntimeError("响应不是 JSON 对象")
         return data
@@ -954,8 +1817,23 @@ class Plugin(Star):
         mime_type = mime_map.get(suffix, "image/png")
         return f"data:{mime_type};base64,{raw}"
 
-    def _build_model_queue(self) -> list[str]:
-        models = [self.active_model_name]
+    def _build_model_queue(
+        self,
+        override_model: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> list[str]:
+        """组装本次回答的模型降级队列。
+
+        优先级：显式 override（同条消息指定）> 会话级一次性预设（消费即清除）
+        > 全局默认 + 可用模型列表。单次指定绝不写入全局状态。
+        """
+        head: Optional[str] = (override_model or "").strip() or None
+        if head is None and session_id is not None:
+            head = (self.pending_model_by_session.pop(session_id, "") or "").strip() or None
+        models: list[str] = []
+        if head:
+            models.append(head)
+        models.append(self.active_model_name)
         models.extend(self.available_models)
         result: list[str] = []
         for model in models:
@@ -964,15 +1842,26 @@ class Plugin(Star):
                 result.append(model)
         return result or ["default"]
 
+    @staticmethod
+    def _extract_m_flag(args: list[str]) -> tuple[str, str]:
+        """从命令参数中剥离 -m 及其模型名，返回 (模型名, 剩余问题文本)。"""
+        args = list(args)
+        model_name = ""
+        if "-m" in args:
+            model_index = args.index("-m")
+            if model_index + 1 < len(args):
+                model_name = args[model_index + 1]
+                del args[model_index:model_index + 2]
+            else:
+                del args[model_index:model_index + 1]
+        return model_name.strip(), " ".join(args).strip()
+
     def _extract_user_question(self, command_text: str) -> str:
         request = self.parse_command(command_text)
         if request is None:
             return command_text.strip()
-        args = list(request.args)
-        if "-m" in args:
-            model_index = args.index("-m")
-            del args[model_index:model_index + 2]
-        return " ".join(args).strip()
+        _model_name, question = self._extract_m_flag(request.args)
+        return question
 
     def _build_attachment_context(self, parsed_message: ParsedMessage) -> str:
         parts: list[str] = []
@@ -985,6 +1874,15 @@ class Plugin(Star):
         finally:
             for temp_dir in temp_dirs:
                 shutil.rmtree(temp_dir, ignore_errors=True)
+        # 排查「附件有没有被取到」只能靠这一行：图片/PDF 数、送 OCR 的页数、OCR 字数
+        logger.info(
+            "附件上下文 images=%d pdfs=%d ocr_inputs=%d ocr_chars=%d reply=%s",
+            len(parsed_message.images),
+            len(parsed_message.pdfs),
+            len(image_paths),
+            len(vision_text),
+            bool(parsed_message.reply_text),
+        )
 
         if vision_text:
             parts.append("附件 OCR 内容：\n" + vision_text[:12000])
@@ -1006,32 +1904,103 @@ class Plugin(Star):
                     parts.append("图片附件（OCR 未取到结果）：" + "，".join(names))
         return "\n\n".join(parts)
 
-    def _parse_structured_answer(self, answer_text: str) -> dict[str, str]:
-        """解析 LLM 返回的 [TITLE]/[SUMMARY] 结构化标记。
+    def _parse_structured_answer(self, answer_text: str) -> dict[str, Any]:
+        """解析 LLM 返回的 [TITLE]/[SUMMARY] 结构化标记与 [ARCHIVE] 归档围栏块。
 
-        返回 {"title", "summary", "body"}。标记缺失或解析失败时对应字段为空，
-        由调用方决定降级策略（标题回退问题截取、提要盒省略），不伪造内容。
+        返回 {"title", "summary", "body", "archive"} 完整四键。契约：
+        任何解析异常都不向调用方抛出——标记缺失或解析失败时对应字段回落
+        默认值，由调用方决定降级策略，不伪造内容。归档块在 body 中整体
+        剥离（围栏外的 [ANSWER] 等字样一律不解析），保证 PDF 零污染。
         """
         title = ""
         summary = ""
-        body_lines: list[str] = []
-        for line in (answer_text or "").splitlines():
-            stripped = line.strip()
-            if not title and stripped.startswith("[TITLE]"):
-                title = stripped.removeprefix("[TITLE]").strip()
-                continue
-            if not summary and stripped.startswith("[SUMMARY]"):
-                summary = stripped.removeprefix("[SUMMARY]").strip()
-                continue
-            body_lines.append(line)
-        body = "\n".join(body_lines).strip()
+        archive = self._empty_archive_dict()
+        try:
+            body_lines: list[str] = []
+            archive_lines: list[str] = []
+            inside_archive = False
+            archive_opened = False
+            for line in (answer_text or "").splitlines():
+                stripped = line.strip()
+                if not inside_archive and stripped == "[ARCHIVE]":
+                    inside_archive = True
+                    archive_opened = True
+                    continue
+                if inside_archive and stripped == "[/ARCHIVE]":
+                    inside_archive = False
+                    continue
+                if inside_archive:
+                    archive_lines.append(stripped)
+                    continue
+                if not title and stripped.startswith("[TITLE]"):
+                    title = stripped.removeprefix("[TITLE]").strip()
+                    continue
+                if not summary and stripped.startswith("[SUMMARY]"):
+                    summary = stripped.removeprefix("[SUMMARY]").strip()
+                    continue
+                body_lines.append(line)
+            if archive_opened:
+                archive = self._parse_archive_block(archive_lines)
+            body = "\n".join(body_lines).strip()
+            # 既有降级：无标记无正文时 body 回落原文；但检测到归档块时不得回落，
+            # 否则会把 [ARCHIVE] 标记重新带回正文、污染 PDF
+            if not archive_opened:
+                body = body or (answer_text or "").strip()
+        except Exception as exc:  # 契约兜底：解析层永不上抛
+            logger.warning("%s 结构化解析异常（已回落默认值） err=%s", WRITEBACK_LOG_PREFIX, exc)
+            return {
+                "title": "",
+                "summary": "",
+                "body": (answer_text or "").strip(),
+                "archive": self._empty_archive_dict(),
+            }
         return {
             "title": title,
             "summary": summary,
-            "body": body or (answer_text or "").strip(),
+            "body": body,
+            "archive": archive,
         }
 
-    def build_tex_source(self, parsed_message: ParsedMessage, body_override: Optional[str] = None, question_text: str = "", title_override: Optional[str] = None, summary_override: Optional[str] = None) -> str:
+    @staticmethod
+    def _empty_archive_dict() -> dict[str, Any]:
+        """未检测到归档块时的缺省结构；present=False 时调用方跳过整个回写。"""
+        return {
+            "present": False,
+            "stem": "",
+            "answer": "",
+            "type": "answer",
+            "difficulty": 3,
+            "tags": [],
+        }
+
+    def _parse_archive_block(self, lines: list[str]) -> dict[str, Any]:
+        """逐行容错解析归档块内容：单行坏只丢该字段并回落默认，不整体作废。"""
+        archive = self._empty_archive_dict()
+        archive["present"] = True
+        for line in lines:
+            if line.startswith("[STEM]"):
+                archive["stem"] = line.removeprefix("[STEM]").strip()
+            elif line.startswith("[ANSWER]"):
+                archive["answer"] = line.removeprefix("[ANSWER]").strip()
+            elif line.startswith("[TYPE]"):
+                value = line.removeprefix("[TYPE]").strip().lower()
+                archive["type"] = value if value in ARCHIVE_TYPE_WHITELIST else "answer"
+            elif line.startswith("[DIFFICULTY]"):
+                value = line.removeprefix("[DIFFICULTY]").strip()
+                if value.isdigit() and 1 <= int(value) <= 5:
+                    archive["difficulty"] = int(value)
+                else:
+                    archive["difficulty"] = 3
+            elif line.startswith("[TAGS]"):
+                tags: list[str] = []
+                for tag in line.removeprefix("[TAGS]").split(","):
+                    tag = tag.strip()
+                    if tag and tag not in tags:
+                        tags.append(tag)
+                archive["tags"] = tags[:ARCHIVE_TAG_LIMIT]
+        return archive
+
+    def build_tex_source(self, parsed_message: ParsedMessage, body_override: Optional[str] = None, question_text: str = "", title_override: Optional[str] = None, summary_override: Optional[str] = None, subtitle_question: Optional[str] = None) -> str:
         if body_override is None:
             body_parts = [parsed_message.reply_text, parsed_message.text]
             body = "\n".join(part for part in body_parts if part).strip() or "请输入要编译的内容。"
@@ -1043,7 +2012,7 @@ class Plugin(Star):
         answer_time = self._escape_tex_metadata(time.strftime("%Y-%m-%d %H:%M:%S"))
         # 标题优先取 LLM 返回，缺失时回退问题截取；不再按关键词猜测分类标题
         title_text = self._escape_tex_metadata((title_override or "").strip() or self._build_document_title(question_text, body))
-        subtitle_text = self._escape_tex_metadata(self._build_document_subtitle(question_text))
+        subtitle_text = self._escape_tex_metadata(self._build_document_subtitle(question_text if subtitle_question is None else subtitle_question))
         # 内容提要仅当 LLM 返回时才渲染，避免硬编码套话
         summary_box = ""
         if summary_override and summary_override.strip():
@@ -1146,6 +2115,7 @@ class Plugin(Star):
         output: list[str] = []
         in_itemize = False
         in_enumerate = False
+        raw_list_envs: list[str] = []
         in_code = False
         code_fence_lang = ""
         in_display_math = False
@@ -1253,7 +2223,7 @@ class Plugin(Star):
                 display_math_lines.append(line)
                 if stripped in {r"\]", "$$"}:
                     for ml in display_math_lines:
-                        emit(ml)
+                        emit(self._normalize_math_span(ml))
                     display_math_lines = []
                     in_display_math = False
                 continue
@@ -1293,6 +2263,23 @@ class Plugin(Star):
             if not stripped:
                 close_lists()
                 emit("")
+                continue
+            raw_list_begin = re.fullmatch(r"\\begin\{(itemize|enumerate)\}", stripped)
+            if raw_list_begin:
+                close_lists()
+                raw_list_envs.append(raw_list_begin.group(1))
+                emit(stripped)
+                continue
+            raw_list_end = re.fullmatch(r"\\end\{(itemize|enumerate)\}", stripped)
+            if raw_list_end and raw_list_envs and raw_list_envs[-1] == raw_list_end.group(1):
+                close_lists()
+                raw_list_envs.pop()
+                emit(stripped)
+                continue
+            raw_item = re.fullmatch(r"\\item(?:\s+(.*))?", stripped)
+            if raw_list_envs and raw_item:
+                close_lists()
+                emit("\\item " + self._tex_inline(raw_item.group(1) or ""))
                 continue
             if stripped in {"---", "***", "___"}:
                 close_lists()
@@ -1351,7 +2338,7 @@ class Plugin(Star):
 
         if in_display_math:
             for ml in display_math_lines:
-                emit(ml)
+                emit(self._normalize_math_span(ml))
         if in_latex_env:
             inner = "\n".join(latex_env_body).strip()
             emit(latex_env_header)
@@ -1386,6 +2373,15 @@ class Plugin(Star):
         text = text.replace("\\%", "%").replace("\\&", "&")
         return text
 
+    def _sanitize_math_percent(self, text: str) -> str:
+        """数学模式里裸 % 是注释符：吞掉行尾后会让公式定界符失效、编译报
+        `Missing $ inserted`。把未转义的 % 补成 \\%（已转义的 \\% 不动）。"""
+        return re.sub(r"(?<!\\)%", r"\\%", text)
+
+    def _normalize_math_span(self, text: str) -> str:
+        text = self._sanitize_math_percent(text)
+        return re.sub(r"\^\\sqrt\{([^{}]+)\}", r"^{\\sqrt{\1}}", text)
+
     def _tex_inline(self, text: str) -> str:
         math_chunks: list[str] = []
         code_chunks: list[str] = []
@@ -1398,15 +2394,25 @@ class Plugin(Star):
             code_chunks.append(match.group(1))
             return f"@@CODE{len(code_chunks) - 1}@@"
 
-        masked = re.sub(r"\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|\$\$[\s\S]*?\$\$|\$[^$\n]+\$", stash_math, text)
+        masked = MATH_SPAN_PATTERN.sub(stash_math, text)
         masked = re.sub(r"`([^`]+)`", stash_code, masked)
+        bold_chunks: list[str] = []
+
+        def stash_bold(match: re.Match[str]) -> str:
+            bold_chunks.append(match.group(1))
+            return f"@@BOLD{len(bold_chunks) - 1}@@"
+
+        masked = re.sub(r"\\textbf\{([^{}]*)\}", stash_bold, masked)
         masked = self._escape_tex(masked)
         masked = re.sub(r"\*\*(.+?)\*\*", r"\\textbf{\1}", masked)
         masked = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\\emph{\1}", masked)
+        for index, value in enumerate(bold_chunks):
+            masked = masked.replace(f"@@BOLD{index}@@", f"\\textbf{{{self._escape_tex(value)}}}")
         for index, value in enumerate(code_chunks):
             masked = masked.replace(f"@@CODE{index}@@", f"\\texttt{{{self._escape_tex(value)}}}")
         for index, value in enumerate(math_chunks):
-            masked = masked.replace(f"@@MATH{index}@@", value)
+            # 数学段原样还原，但裸 % 必须转义，否则编译炸在公式定界符上
+            masked = masked.replace(f"@@MATH{index}@@", self._normalize_math_span(value))
         return masked
 
     def _escape_tex_metadata(self, text: str) -> str:
@@ -1478,7 +2484,7 @@ class Plugin(Star):
                 models.append(str(model_id))
         return models
 
-    def _format_model_list(self) -> str:
+    def _format_model_list(self, session_id: Optional[str] = None) -> str:
         remote_models: list[str] = []
         remote_error = ""
         try:
@@ -1493,6 +2499,10 @@ class Plugin(Star):
             f"当前模型：{self.active_model_name}",
             "可用模型：" + ", ".join(models),
         ]
+        if session_id is not None:
+            pending = self.pending_model_by_session.get(session_id)
+            if pending:
+                lines.append(f"本会话下一题已指定：{pending}（一次性，不影响全局）")
         if remote_error:
             lines.append(f"远程查询失败，已使用本地列表：{remote_error[:200]}")
         return "\n".join(lines)
@@ -1505,6 +2515,55 @@ class Plugin(Star):
         except Exception:
             return ""
         return content[-2000:]
+
+    def _sanitize_math_in_body(self, tex_source: str) -> str:
+        """只对 \\begin{document} 之后的正文区做数学段 % 净化。
+
+        导言区由模板生成，其中的 % 是有意的行尾注释（如 \\fancypagestyle{...}{%），
+        绝不能转义；正文区的数学片段里裸 % 才是编译炸弹。
+        """
+
+        def sanitize_spans(region: str) -> str:
+            return MATH_SPAN_PATTERN.sub(
+                lambda match: self._sanitize_math_percent(match.group(0)),
+                region,
+            )
+
+        begin_marker = "\\begin{document}"
+        end_marker = "\\end{document}"
+        begin_index = tex_source.find(begin_marker)
+        end_index = tex_source.rfind(end_marker)
+        if begin_index == -1 or end_index == -1 or end_index <= begin_index:
+            return sanitize_spans(tex_source)
+        body_start = begin_index + len(begin_marker)
+        return (
+            tex_source[:body_start]
+            + sanitize_spans(tex_source[body_start:end_index])
+            + tex_source[end_index:]
+        )
+
+    def _repair_tex_source(self, tex_source: str, compile_result: CompileResult) -> Optional[str]:
+        """证据式修复：仅当日志/输出里出现已识别的错误模式时才尝试修复，
+        修复后与原文相同则返回 None（不触发无意义重试）。
+
+        当前覆盖的模式：
+        - `Missing $ inserted`：数学模式里裸 % 吞掉公式定界符 → 净化数学段 %。
+        """
+        evidence = " ".join(
+            part
+            for part in (
+                compile_result.stderr or "",
+                compile_result.stdout or "",
+                self._read_log_snippet(compile_result.log_path),
+            )
+            if part
+        )
+        if "Missing $ inserted" not in evidence:
+            return None
+        repaired = self._sanitize_math_in_body(tex_source)
+        if repaired == tex_source:
+            return None
+        return repaired
 
     def _build_image_block(self, images: list[MessageAttachment]) -> str:
         if not images:
@@ -1608,7 +2667,168 @@ class Plugin(Star):
     def localize_attachments(self, parsed_message: ParsedMessage) -> ParsedMessage:
         parsed_message.images = self._localize_attachments(parsed_message.images)
         parsed_message.pdfs = self._localize_attachments(parsed_message.pdfs)
+        # 拍照/转发的截图常整体侧转 90°，视觉 OCR 对侧转文字会整段编造题目；
+        # 在 OCR 与 PDF 插图之前统一转正（OCR 和 \includegraphics 读的是同一个文件）
+        if not getattr(self, "orientation_correction_enabled", True):
+            return parsed_message
+        budget = OrientationBudget(deadline=time.monotonic() + ORIENTATION_BUDGET_SECONDS)
+        for image in parsed_message.images:
+            self._normalize_image_orientation(image, budget)
         return parsed_message
+
+    def _normalize_image_orientation(self, attachment: MessageAttachment, budget: Optional[OrientationBudget] = None) -> None:
+        """把已本地化到 assets/ 的图片原地转正：先应用 EXIF 方向，再请视觉模型挑正向。
+
+        只改插件自己下载的副本；任何失败都保持原图不动，不影响后续问答。
+        判定只用缩略图，确认要旋转时才整图解码一次。
+        """
+        local_path = Path(attachment.path) if attachment.path else None
+        asset_dir = getattr(self, "asset_dir", None)
+        if local_path is None or asset_dir is None:
+            return
+        try:
+            if not local_path.is_file() or local_path.resolve().parent != Path(asset_dir).resolve():
+                return
+        except (OSError, ValueError):
+            return
+        try:
+            from PIL import Image, ImageOps  # type: ignore
+        except Exception:
+            return
+        if budget is None:
+            budget = OrientationBudget(deadline=time.monotonic() + ORIENTATION_BUDGET_SECONDS)
+
+        try:
+            with Image.open(local_path) as opened:
+                image_format = opened.format
+                # 动图只转首帧会丢动画，直接跳过；超大图不在进程内解码
+                if image_format not in {"JPEG", "PNG", "WEBP", "BMP", "TIFF"} or getattr(opened, "n_frames", 1) > 1:
+                    return
+                if opened.width * opened.height > ORIENTATION_MAX_PIXELS:
+                    return
+                exif_rotated = opened.getexif().get(0x0112, 1) not in (0, 1)
+                width, height = opened.size
+                # JPEG 走 draft 按比例降采样解码，判定阶段只持有缩略图大小的内存
+                opened.draft("RGB", (ORIENTATION_THUMBNAIL_SIZE, ORIENTATION_THUMBNAIL_SIZE))
+                if exif_rotated:
+                    preview = ImageOps.exif_transpose(opened)
+                    preview.thumbnail((ORIENTATION_THUMBNAIL_SIZE, ORIENTATION_THUMBNAIL_SIZE))
+                else:
+                    opened.thumbnail((ORIENTATION_THUMBNAIL_SIZE, ORIENTATION_THUMBNAIL_SIZE))
+                    preview = opened.copy()
+        except Exception:
+            return
+
+        angle = 0
+        if max(width, height) <= ORIENTATION_MAX_ASPECT * min(width, height):
+            angle = self._detect_upright_rotation(preview, budget)
+        if not angle and not exif_rotated:
+            return
+        if self._rewrite_rotated_image(local_path, image_format, angle):
+            logger.info("图片方向已转正 file=%s exif=%s rotate_ccw=%d", local_path.name, exif_rotated, angle)
+
+    def _rewrite_rotated_image(self, local_path: Path, image_format: str, angle: int) -> bool:
+        """整图解码 → 应用 EXIF 方向与逆时针 angle 度旋转 → 原子替换；失败保持原图并返回 False。"""
+        from PIL import Image, ImageOps  # type: ignore
+
+        # transpose 是无损的像素重排
+        rotations = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180, 270: Image.Transpose.ROTATE_270}
+        temp_path: Optional[Path] = None
+        try:
+            # 同一源并发本地化时各写各的临时文件，互不踩踏
+            fd, temp_name = tempfile.mkstemp(prefix=f".{local_path.name}.", suffix=".rotating", dir=local_path.parent)
+            os.close(fd)
+            temp_path = Path(temp_name)
+            with Image.open(local_path) as opened:
+                icc_profile = opened.info.get("icc_profile")
+                image = ImageOps.exif_transpose(opened)
+            if angle:
+                image = image.transpose(rotations[angle])
+            save_options: dict[str, Any] = {"icc_profile": icc_profile} if icc_profile else {}
+            if image_format == "JPEG":
+                # 不写回 EXIF：方向已烘焙进像素，保留方向标签会被查看器二次旋转
+                if image.mode != "RGB":
+                    image = image.convert("RGB")
+                image.save(temp_path, format="JPEG", quality=95, **save_options)
+            elif image_format == "WEBP":
+                image.save(temp_path, format="WEBP", lossless=True, **save_options)
+            else:
+                image.save(temp_path, format=image_format)
+            os.replace(temp_path, local_path)
+        except Exception as exc:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+            logger.warning("图片方向转正写回失败（保持原图） file=%s err=%s", local_path.name, exc)
+            return False
+        return True
+
+    def _detect_upright_rotation(self, preview: Any, budget: OrientationBudget) -> int:
+        """返回让图片文字正立需要的逆时针旋转角度（0/90/180/270），判定不了返回 0。
+
+        把同一张图的四种旋转并排给视觉模型挑正向的那张（比较题比方向判断题稳得多）。
+        判为需要旋转时再倒序问一次，两次一致才采纳：误转一张本来正的图，
+        比不转一张侧着的图更糟。只用主视觉模型，备用模型未验证过这项能力。
+        """
+        if not getattr(self, "ocr_api_url", "") or not getattr(self, "ocr_api_key", "") or not getattr(self, "vision_model_name", ""):
+            return 0
+        try:
+            from PIL import Image  # type: ignore
+
+            # 透明底直接转 RGB 会变成全黑，四张候选一模一样，先铺白底
+            if preview.mode in {"RGBA", "LA", "PA"} or (preview.mode == "P" and "transparency" in preview.info):
+                rgba = preview.convert("RGBA")
+                thumbnail = Image.new("RGB", rgba.size, (255, 255, 255))
+                thumbnail.paste(rgba, mask=rgba.getchannel("A"))
+            else:
+                thumbnail = preview.convert("RGB")
+            candidates: dict[int, str] = {}
+            for angle, method in ((0, None), (90, Image.Transpose.ROTATE_90), (180, Image.Transpose.ROTATE_180), (270, Image.Transpose.ROTATE_270)):
+                rotated = thumbnail if method is None else thumbnail.transpose(method)
+                buffer = io.BytesIO()
+                rotated.save(buffer, format="JPEG", quality=80)
+                candidates[angle] = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+        except Exception:
+            return 0
+
+        first = self._ask_upright_candidate(candidates, [0, 90, 180, 270], budget)
+        if not first:
+            return 0
+        confirmed = self._ask_upright_candidate(candidates, [270, 180, 90, 0], budget)
+        if confirmed != first:
+            logger.info("图片方向两次判定不一致（保持原图） first=%s confirm=%s", first, confirmed)
+            return 0
+        return first
+
+    def _ask_upright_candidate(self, candidates: dict[int, str], order: list[int], budget: OrientationBudget) -> Optional[int]:
+        timeout = budget.timeout()
+        if timeout <= 0:
+            return None
+        content: list[dict[str, Any]] = [{"type": "text", "text": ORIENTATION_PROMPT}]
+        for index, angle in enumerate(order, 1):
+            content.append({"type": "text", "text": f"图 {index}："})
+            content.append({"type": "image_url", "image_url": {"url": candidates[angle]}})
+        try:
+            data = self._post_chat_completion(
+                api_url=self.ocr_api_url,
+                api_key=self.ocr_api_key,
+                payload={
+                    "model": self.vision_model_name,
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": content}],
+                },
+                timeout=timeout,
+            )
+            answer = self._extract_chat_content(data)
+        except Exception as exc:
+            # 429/超时后本条消息的其余图片不再判定：别在限流的 key 上、紧挨着 OCR 继续加请求
+            budget.failed = True
+            logger.warning("图片方向判定调用失败（保持原图，本条消息停止判定） err=%s", exc)
+            return None
+        match = re.search(r"[1-4]", answer or "")
+        if match is None:
+            return None
+        return order[int(match.group()) - 1]
+
 
     def _localize_attachments(self, attachments: list[MessageAttachment]) -> list[MessageAttachment]:
         localized: list[MessageAttachment] = []
@@ -2067,18 +3287,187 @@ class Plugin(Star):
                     return stripped
         return ""
 
-    def _extract_model_switch(self, text: str) -> Optional[str]:
+    def _extract_model_switch(self, text: str) -> Optional[ModelDirective]:
+        """解析「指定模型」指令，区分持久切换与单次指定。
+
+        - 「切换到X模型」：持久切换，改全局默认（保留给真想改默认的人）。
+        - 「用/使用X模型回答」：单次指定，只影响本题或本会话下一题。
+        - 「用/使用X模型回答 问题内容」：单次指定并直接回答同条消息里的问题。
+        """
         stripped = text.strip()
-        patterns = [
-            r"^使用\s+(.+?)\s+模型回答$",
-            r"^切换到\s+(.+?)\s*模型$",
-            r"^用\s+(.+?)\s+模型回答$",
-        ]
-        for pattern in patterns:
-            match = re.match(pattern, stripped)
-            if match:
-                return match.group(1).strip()
+        persistent_pattern = r"^切换到\s+(.+?)\s*模型$"
+        match = re.match(persistent_pattern, stripped)
+        if match:
+            return ModelDirective(model=match.group(1).strip(), persistent=True)
+
+        one_shot_with_question = re.compile(
+            r"^(?:使用|用)\s+(.+?)\s+模型回答[:：]?\s+(.+)$",
+            re.DOTALL,
+        )
+        match = one_shot_with_question.match(stripped)
+        if match:
+            return ModelDirective(
+                model=match.group(1).strip(),
+                persistent=False,
+                question=match.group(2).strip(),
+            )
+
+        one_shot_pattern = r"^(?:使用|用)\s+(.+?)\s+模型回答[:：]?\s*$"
+        match = re.match(one_shot_pattern, stripped)
+        if match:
+            return ModelDirective(model=match.group(1).strip(), persistent=False)
         return None
+
+    def _apply_model_directive(self, directive: ModelDirective, session_id: str) -> Optional[CommandResponse]:
+        """执行模型指令。返回 CommandResponse 表示本轮直接回复；
+        返回 None 表示「单次指定且同条带问题」，调用方应继续走回答流程。"""
+        if directive.persistent:
+            self._set_active_model(directive.model)
+            return CommandResponse(success=True, message=f"已切换模型：{directive.model}")
+        if directive.question:
+            return None
+        self.pending_model_by_session[session_id] = directive.model
+        return CommandResponse(
+            success=True,
+            message=f"已为下一题指定模型：{directive.model}（仅本会话下一题生效，不影响全局）",
+        )
+
+    def _extract_question_numbers(self, text: str) -> list[int]:
+        """指令里点了 ≥2 个题号时返回升序去重的题号，否则返回空列表（按单题处理）。
+
+        认「第8、10题」「8-11题」「第8题和第10题」「第八到十题」；
+        带「一起/合并/对比/比较…」等词表示要放在一起讲，不拆分。
+        """
+        if not text or any(word in text for word in MULTI_QUESTION_OPT_OUT_WORDS):
+            return []
+        numbers: set[int] = set()
+        for match in QUESTION_GROUP_PATTERN.finditer(text):
+            parts = QUESTION_GROUP_SEPARATOR.split(match.group(2))
+            tokens = [part.lstrip("第") for part in parts[0::2]]
+            separators = parts[1::2]
+            # 「下一题」「这一题」里的「一」不是题号：中文数字题号必须带「第」
+            if not tokens[0].isdigit() and not match.group(1):
+                continue
+            if text[:match.start()].rstrip().endswith(MULTI_QUESTION_REFERENCE_PREFIXES):
+                continue
+            values = [self._question_token_to_int(token) for token in tokens]
+            if any(value is None or not 1 <= value <= 999 for value in values):
+                continue
+            group: set[int] = {values[0]}
+            for index, separator in enumerate(separators):
+                left, right = values[index], values[index + 1]
+                if separator in _QUESTION_RANGE_SEPARATORS:
+                    # 「1-100题」这种显然不是要逐题各出一份
+                    if not left <= right or right - left > MULTI_QUESTION_RANGE_LIMIT:
+                        group = set()
+                        break
+                    group.update(range(left, right + 1))
+                else:
+                    group.add(right)
+            numbers |= group
+        return sorted(numbers) if len(numbers) >= 2 else []
+
+    @staticmethod
+    def _question_token_to_int(token: str) -> Optional[int]:
+        if token.isdigit():
+            return int(token)
+        digits = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+        if "十" in token:
+            head, _, tail = token.partition("十")
+            if (head and head not in digits) or (tail and tail not in digits):
+                return None
+            return (digits[head] if head else 1) * 10 + (digits[tail] if tail else 0)
+        return digits.get(token) if len(token) == 1 else None
+
+    @staticmethod
+    def _format_question_numbers(numbers: list[int]) -> str:
+        return "第" + "、".join(str(number) for number in numbers) + "题"
+
+    def _format_multi_question_notice(self, answered: list[int], missing: list[int], overflow: list[int]) -> str:
+        """缺题或超出回复次数时才发的说明；一切正常返回空串，不占回复次数。"""
+        problems: list[str] = []
+        if missing:
+            problems.append(f"没在图片/引用里找到{self._format_question_numbers(missing)}")
+        if overflow:
+            problems.append(f"一条消息最多回复 {len(answered) + 1} 次，{self._format_question_numbers(overflow)}请另发一条指令")
+        if not problems:
+            return ""
+        return f"正在分别作答{self._format_question_numbers(answered)}，每题完成后单独发一份 PDF。" + "；".join(problems) + "。"
+
+    def _build_question_focus(self, number: int, answered: list[int], stem: str) -> str:
+        others = [other for other in answered if other != number]
+        if others:
+            lines = [f"本次只解答第{number}题；{self._format_question_numbers(others)}会另外单独解答，这里不要涉及。"]
+        else:
+            lines = [f"本次只解答第{number}题，不要解答其他题目。"]
+        if stem:
+            lines.append(f"第{number}题题干：\n{stem}")
+        else:
+            lines.append(f"请在下面的附件内容里找到第{number}题的完整题干再作答。")
+        lines.append("附件里的其他题目只用作共用条件的参考。")
+        return "\n".join(lines)
+
+    def _reply_slots(self, event: Any) -> int:
+        """一条指令最多能被动回复几次。QQ 官方机器人：群聊 5 次，单聊 4 次。"""
+        platform = ""
+        getter = getattr(event, "get_platform_name", None)
+        if callable(getter):
+            try:
+                platform = str(getter() or "")
+            except Exception:
+                platform = ""
+        if not platform.startswith("qq_official"):
+            return getattr(self, "reply_limit_other", DEFAULT_REPLY_SLOTS)
+        is_private = getattr(event, "is_private_chat", None)
+        try:
+            private = bool(is_private()) if callable(is_private) else True
+        except Exception:
+            private = True
+        # 判断不了会话类型时按更严格的单聊次数算
+        if private:
+            return getattr(self, "reply_limit_private", QQ_OFFICIAL_C2C_REPLY_SLOTS)
+        return getattr(self, "reply_limit_group", QQ_OFFICIAL_GROUP_REPLY_SLOTS)
+
+    def _split_questions(self, attachment_context: str, numbers: list[int], override_model: Optional[str] = None) -> Optional[dict[int, str]]:
+        """让文本模型从 OCR/引用内容里找出指定题号的完整题干。
+
+        返回 {题号: 题干}，找不到的题不在其中；拆题调用本身失败返回 None。
+        用 [Q n] 标记而不是 JSON：题干满是 LaTeX 反斜杠，JSON 转义会随机解析失败。
+        """
+        if not (attachment_context or "").strip() or not self.text_api_url or not self.text_api_key:
+            return None
+        messages = [
+            {"role": "system", "content": QUESTION_SPLIT_PROMPT},
+            {"role": "user", "content": f"要找的题号：{'、'.join(str(number) for number in numbers)}\n\n{attachment_context[:20000]}"},
+        ]
+        for model_name in self._build_model_queue(override_model=override_model)[:2]:
+            try:
+                answer = self._call_text_model(model_name, messages)
+            except Exception as exc:
+                logger.warning("拆题调用失败 model=%s err=%s", model_name, exc)
+                continue
+            stems = self._parse_split_questions(answer, numbers)
+            if stems is not None:
+                return stems
+        return None
+
+    @staticmethod
+    def _parse_split_questions(answer: str, numbers: list[int]) -> Optional[dict[int, str]]:
+        text = re.sub(r"^[ \t]*`{3,}[A-Za-z]*[ \t]*$", "", answer or "", flags=re.MULTILINE)
+        has_missing_line = QUESTION_SPLIT_MISSING_LINE.search(text) is not None
+        body = QUESTION_SPLIT_MISSING_LINE.sub("", text)
+        markers = list(QUESTION_SPLIT_MARKER.finditer(body))
+        if not markers and not has_missing_line:
+            return None
+        wanted = set(numbers)
+        stems: dict[int, str] = {}
+        for index, marker in enumerate(markers):
+            end = markers[index + 1].start() if index + 1 < len(markers) else len(body)
+            number = int(marker.group(1))
+            stem = body[marker.end():end].strip()
+            if number in wanted and stem and number not in stems:
+                stems[number] = stem[:4000]
+        return stems
 
     def _is_source_export_command(self, text: str) -> bool:
         command = text.strip().split(maxsplit=1)[0] if text.strip() else ""
@@ -2098,7 +3487,47 @@ class Plugin(Star):
             return None
 
     def _extract_qq_number(self, event: Any) -> str:
-        """从事件中提取发送者 QQ 号，作为文件命名前缀。"""
+        """从事件中提取发送者标识，作为文件命名前缀。
+
+        优先使用纯数字 QQ 号；官方机器人等平台只有 openid 哈希，
+        此时改用发送者昵称，避免文件名出现无意义的长哈希。
+        """
+        if event is None:
+            return ""
+        message_obj = getattr(event, "message_obj", None)
+        sender = getattr(message_obj, "sender", None) if message_obj is not None else None
+        user_id = ""
+        for source in (sender, event):
+            if source is None:
+                continue
+            for attr in ("user_id", "qq", "sender_id"):
+                value = getattr(source, attr, None)
+                if value:
+                    user_id = str(value)
+                    break
+            if user_id:
+                break
+        if user_id.isdigit():
+            return user_id
+        nickname = ""
+        getter = getattr(event, "get_sender_name", None)
+        if callable(getter):
+            try:
+                nickname = (getter() or "").strip()
+            except Exception:
+                nickname = ""
+        if not nickname and sender is not None:
+            nickname = str(getattr(sender, "nickname", "") or "").strip()
+        if nickname:
+            return nickname
+        return user_id[:8] if user_id else ""
+
+    def _extract_sender_subject(self, event: Any) -> str:
+        """提取发送者原始渠道标识（QQ 号或官方机器人 openid），供题库身份匹配。
+
+        与 _extract_qq_number 不同：这里不做昵称回退——身份匹配必须用
+        稳定原始 id（openid/QQ 号），昵称会变且无法与绑定记录对应。
+        """
         if event is None:
             return ""
         message_obj = getattr(event, "message_obj", None)
@@ -2112,9 +3541,118 @@ class Plugin(Star):
                     return str(value)
         return ""
 
+    def _extract_message_id(self, event: Any) -> str:
+        """从事件中提取消息 id（duck-typing 多属性探测，仿 _extract_qq_number）。
+
+        AstrBot 各适配器的属性名不统一，逐一探测；取不到返回空串，
+        由 _build_external_id 回落时间戳+哈希方案。
+        """
+        if event is None:
+            return ""
+        for source in (event, getattr(event, "message_obj", None)):
+            if source is None:
+                continue
+            for attr in ("message_id", "msg_id", "id"):
+                value = getattr(source, attr, None)
+                if value:
+                    return str(value)
+        return ""
+
+    def _build_external_id(self, event: Any, question_text: str) -> str:
+        """构建回写幂等键：优先 qq:<消息id>（重发天然去重），
+        取不到时回落 ts:<秒级时间戳>:<题干 sha256 前 16 位>。"""
+        message_id = self._extract_message_id(event)
+        if message_id:
+            return f"qq:{message_id}"
+        digest = hashlib.sha256((question_text or "").encode("utf-8")).hexdigest()[:16]
+        return f"ts:{time.strftime('%Y%m%d%H%M%S')}:{digest}"
+
+    def _build_archive_draft(self, structured: dict[str, Any], question_text: str, image_urls: list[str]) -> dict[str, Any]:
+        """组装归档 draft（API 白名单字段）：stem 缺失回落原始提问，
+        answer 缺失回落 [SUMMARY]，其余字段直接取解析结果。"""
+        archive = structured.get("archive") if isinstance(structured.get("archive"), dict) else self._empty_archive_dict()
+        summary = str(structured.get("summary", "") or "")
+        analysis_text = str(structured.get("body", "") or "")
+        answer_text = str(archive.get("answer", "") or "") or summary or "（模型未给出答案）"
+        return {
+            "stem": str(archive.get("stem", "") or "") or (question_text or "").strip(),
+            "answer": answer_text,
+            "analysis": analysis_text,
+            "type": str(archive.get("type", "") or "answer"),
+            "difficulty": int(archive.get("difficulty", 3) or 3),
+            "images": list(image_urls or []),
+            "tags": list(archive.get("tags") or []),
+        }
+
+    def _build_question_image_urls(self, parsed_message: ParsedMessage) -> list[str]:
+        """题目图片公网 URL：仅取已本地化（落在受管目录内）的图片，
+        经文件服务 asset 路由对外暴露；远程直链与不可达文件一律跳过。"""
+        urls: list[str] = []
+        for image in parsed_message.images:
+            local_path = (image.path or "").replace("file://", "")
+            if not local_path:
+                continue
+            try:
+                if not self._is_managed_path(Path(local_path)):
+                    continue
+            except Exception:
+                continue
+            urls.append(self._public_file_url(Path(local_path)))
+        return urls
+
+    def _build_writeback_payload(
+        self,
+        event: Any,
+        question_text: str,
+        structured: dict[str, Any],
+        parsed_message: ParsedMessage,
+        session_id: str,
+        base_name: str,
+        used_model: str,
+        response: CommandResponse,
+    ) -> dict[str, Any]:
+        """组装回写 payload：入队时刻冻结全部字段，worker 消费时不再依赖外部状态。"""
+        image_urls = self._build_question_image_urls(parsed_message)
+        summary = str(structured.get("summary", "") or "")
+        archive = structured.get("archive") if isinstance(structured.get("archive"), dict) else self._empty_archive_dict()
+        answer_text = str(archive.get("answer", "") or "") or summary or "（模型未给出答案）"
+        analysis_text = str(structured.get("body", "") or "")
+        pdf_url = ""
+        if response.file_payload and response.file_payload.get("url"):
+            pdf_url = str(response.file_payload["url"])
+        return {
+            "external_id": self._build_external_id(event, question_text),
+            "question_text": question_text,
+            "question_images": image_urls,
+            # 回写身份匹配用原始 sender id（QQ 号/官方机器人 openid），
+            # 与题库 user_identities 绑定记录的 # 后缀对应；文件命名另用昵称。
+            "qq": self._extract_sender_subject(event),
+            "meta": {
+                "model": used_model,
+                "base_name": base_name,
+                "pdf_url": pdf_url,
+                "session_id": session_id,
+            },
+            "answer_text": answer_text,
+            "analysis_text": analysis_text,
+            "draft": self._build_archive_draft(structured, question_text, image_urls),
+        }
+
+    def _enqueue_qa_writeback(self, payload: dict[str, Any]) -> None:
+        """回写入队钩子：内部全兜底，任何异常都不允许上抛到调用方。"""
+        try:
+            scheduler = getattr(self, "writeback_scheduler", None)
+            # 入队成功 = 这些题图 URL 即将写进题库，定期清理必须放过它们
+            if scheduler is not None and scheduler.enqueue(payload):
+                self._remember_protected_assets(list(payload.get("question_images") or []))
+        except Exception as exc:
+            logger.warning("%s 入队钩子异常（已忽略） err=%s", WRITEBACK_LOG_PREFIX, exc)
+
     def _extract_question_keyword(self, question_text: str) -> str:
         """从题目文本中提取简洁关键词，作为文件命名的可识别标识。"""
-        normalized = re.sub(r"\s+", "", question_text or "")
+        # 先去掉 LaTeX 命令名（\geqslant、\frac…），否则多题题干会让文件名变成 xgeqslant0 这样
+        normalized = re.sub(r"\\[A-Za-z]+", "", question_text or "")
+        normalized = re.sub(r"\s+", "", normalized)
         normalized = re.sub(r"^(ai|ask|解答|解析|/)+", "", normalized, flags=re.IGNORECASE)
         cleaned = re.sub(r"[，。；：,.!?！？、()（）\[\]【】{}\"'`~!@#$%^&*+=|\\/<>]", "", normalized)
         return cleaned[:16]
@@ -2157,7 +3695,7 @@ class Plugin(Star):
         except OSError:
             parent = exported_path.parent
         prefix = "pdf"
-        for category_prefix, category_dir in (("source", self.source_dir), ("log", self.log_dir)):
+        for category_prefix, category_dir in (("source", self.source_dir), ("log", self.log_dir), ("asset", self.asset_dir)):
             if category_dir is None:
                 continue
             try:
@@ -2183,11 +3721,12 @@ class Plugin(Star):
         self._file_server_thread.start()
 
     def _build_file_handler(self):
-        # 按分类目录路由：/pdf/ → pdfs/，/source/ → sources/，/log/ → logs/
+        # 按分类目录路由：/pdf/ → pdfs/，/source/ → sources/，/log/ → logs/，/asset/ → assets/
         category_dirs = {
             "pdf": self.pdf_dir,
             "source": self.source_dir,
             "log": self.log_dir,
+            "asset": self.asset_dir,
         }
 
         class QuietHandler(SimpleHTTPRequestHandler):
